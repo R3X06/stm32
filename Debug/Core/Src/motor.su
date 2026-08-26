@@ -1,0 +1,8 @@
+../Core/Src/motor.c:23:6:motors_init	8	static
+../Core/Src/motor.c:41:6:motorA	16	static
+../Core/Src/motor.c:55:6:motorB	16	static
+../Core/Src/motor.c:69:6:motors_stop	4	static
+../Core/Src/motor.c:77:10:encA_count	4	static
+../Core/Src/motor.c:78:10:encB_count	4	static
+../Core/Src/motor.c:80:9:encA_delta	16	static
+../Core/Src/motor.c:88:9:encB_delta	16	static

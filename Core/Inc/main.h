@@ -7,7 +7,7 @@
   ******************************************************************************
   * @attention
   *
-  * Copyright (c) 2022 STMicroelectronics.
+  * Copyright (c) 2026 STMicroelectronics.
   * All rights reserved.
   *
   * This software is licensed under terms that can be found in the LICENSE file
@@ -59,18 +59,6 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define OLED1_Pin GPIO_PIN_5
-#define OLED1_GPIO_Port GPIOE
-#define OLED2_Pin GPIO_PIN_6
-#define OLED2_GPIO_Port GPIOE
-#define AIN2_Pin GPIO_PIN_2
-#define AIN2_GPIO_Port GPIOA
-#define AIN1_Pin GPIO_PIN_3
-#define AIN1_GPIO_Port GPIOA
-#define BIN1_Pin GPIO_PIN_4
-#define BIN1_GPIO_Port GPIOA
-#define BIN2_Pin GPIO_PIN_5
-#define BIN2_GPIO_Port GPIOA
 #define OLED3_Pin GPIO_PIN_7
 #define OLED3_GPIO_Port GPIOE
 #define OLED4_Pin GPIO_PIN_8
@@ -84,12 +72,6 @@ void Error_Handler(void);
 #define USER_PB_Pin GPIO_PIN_8
 #define USER_PB_GPIO_Port GPIOD
 #define USER_PB_EXTI_IRQn EXTI9_5_IRQn
-#define PWMA_Pin GPIO_PIN_6
-#define PWMA_GPIO_Port GPIOC
-#define PWMB_Pin GPIO_PIN_7
-#define PWMB_GPIO_Port GPIOC
-#define PWMD_Pin GPIO_PIN_9
-#define PWMD_GPIO_Port GPIOC
 #define IMU_INT_Pin GPIO_PIN_1
 #define IMU_INT_GPIO_Port GPIOE
 #define IMU_INT_EXTI_IRQn EXTI1_IRQn
