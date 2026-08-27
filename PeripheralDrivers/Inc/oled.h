@@ -1,5 +1,5 @@
 #ifndef __OLED_H
-#define __OLED_H
+#define __OLED_H			  	 
 
 #include "stm32f4xx_hal.h"
 #define u8 uint8_t
@@ -34,10 +34,10 @@ extern u8 OLED_GRAM[128][8];
 #define OLED_Width			128
 
 //Oled control function
-void OLED_WR_Byte(u8 dat,u8 cmd);
+void OLED_WR_Byte(u8 dat,u8 cmd);	    
 void OLED_Display_On(void);
 void OLED_Display_Off(void);
-void OLED_Refresh_Gram(void);
+void OLED_Refresh_Gram(void);		   				   		    
 void OLED_Init(void);
 void OLED_Clear(void);
 void OLED_DrawPoint(u8 x,u8 y,u8 t);
@@ -47,5 +47,5 @@ void OLED_ShowString(u8 x,u8 y,const u8 *p);
 void OLED_ShowString16(u8 x,u8 y,const u8 *p);
 void OLED_Refresh_Line(void);
 
-#endif
-
+#endif  
+	 

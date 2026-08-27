@@ -1,9 +1,0 @@
-../Core/Src/motor.c:23:13:drive	24	static
-../Core/Src/motor.c:47:6:motors_init	8	static
-../Core/Src/motor.c:68:6:motorA	24	static
-../Core/Src/motor.c:69:6:motorB	24	static
-../Core/Src/motor.c:71:6:motors_stop	4	static
-../Core/Src/motor.c:79:10:encA_count	4	static
-../Core/Src/motor.c:80:10:encB_count	4	static
-../Core/Src/motor.c:84:9:encA_delta	16	static
-../Core/Src/motor.c:92:9:encB_delta	16	static

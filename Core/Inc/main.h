@@ -49,8 +49,6 @@ extern "C" {
 
 /* USER CODE END EM */
 
-void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
-
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
 
@@ -61,24 +59,14 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define LED3_Pin GPIO_PIN_8
 #define LED3_GPIO_Port GPIOE
-#define MOTC_IN2_Pin GPIO_PIN_9
-#define MOTC_IN2_GPIO_Port GPIOE
-#define MOTC_IN1_Pin GPIO_PIN_11
-#define MOTC_IN1_GPIO_Port GPIOE
-#define MOTD_IN2_Pin GPIO_PIN_13
-#define MOTD_IN2_GPIO_Port GPIOE
-#define MOTD_IN1_Pin GPIO_PIN_14
-#define MOTD_IN1_GPIO_Port GPIOE
-#define MOTA_IN2_Pin GPIO_PIN_8
-#define MOTA_IN2_GPIO_Port GPIOB
-#define MOTA_IN1_Pin GPIO_PIN_9
-#define MOTA_IN1_GPIO_Port GPIOB
-#define USER_BTN_Pin GPIO_PIN_0
-#define USER_BTN_GPIO_Port GPIOE
-#define USER_BTN_EXTI_IRQn EXTI0_IRQn
-#define IMU_INT_Pin GPIO_PIN_1
-#define IMU_INT_GPIO_Port GPIOE
-#define IMU_INT_EXTI_IRQn EXTI1_IRQn
+#define OLED_DC_Pin GPIO_PIN_11
+#define OLED_DC_GPIO_Port GPIOD
+#define OLED_RES_Pin GPIO_PIN_12
+#define OLED_RES_GPIO_Port GPIOD
+#define OLED_SDA_Pin GPIO_PIN_13
+#define OLED_SDA_GPIO_Port GPIOD
+#define OLED_SCL_Pin GPIO_PIN_14
+#define OLED_SCL_GPIO_Port GPIOD
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
