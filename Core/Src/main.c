@@ -44,7 +44,6 @@
  TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
-TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim9;
 TIM_HandleTypeDef htim12;
 
@@ -52,6 +51,8 @@ UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+volatile uint8_t  btn_pressed = 0;
+volatile uint8_t  test_stage  = 0;
 
 /* USER CODE END PV */
 
@@ -59,7 +60,6 @@ UART_HandleTypeDef huart3;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART3_UART_Init(void);
-static void MX_TIM8_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM12_Init(void);
@@ -104,7 +104,6 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART3_UART_Init();
-  MX_TIM8_Init();
   MX_TIM2_Init();
   MX_USART2_UART_Init();
   MX_TIM12_Init();
@@ -112,37 +111,59 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM9_Init();
   /* USER CODE BEGIN 2 */
-  motors_init();
+
+  motors_init();          /* CCRs zeroed, then PWM started */
   OLED_Init();
-  OLED_ShowString(10, 10, (uint8_t *)"MOTOR");
+  OLED_ShowString(10, 10, (uint8_t *)"T0 idle");
   OLED_Refresh_Gram();
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  char buf[32];
+  uint8_t stage = 0;
+
   while (1)
   {
-    /* USER CODE END WHILE */
+      switch (stage) {
+      case 0:
+          motors_stop();
+          break;
+      case 1:
+          motorA(3000);  motorB(0);
+          break;
+      case 2:
+          motorA(0);     motorB(3000);
+          break;
+      case 3:
+          motorA(3000);  motorB(3000);
+          break;
+      }
+      /* ---- switch ends here; dump runs every stage ---- */
 
-    /* USER CODE BEGIN 3 */
-	  	  motorA(3000);
-	      motorB(3000);
-	      HAL_Delay(2000);
+      sprintf(buf, "T%d  A%d B%d   ", stage, encA_delta(), encB_delta());
+      OLED_ShowString(0, 0, (uint8_t *)buf);
 
-	      motors_stop();
-	      HAL_Delay(2000);
+      sprintf(buf, "4:%lu %lu      ", TIM4->CCR4, TIM4->CCR3);
+      OLED_ShowString(0, 16, (uint8_t *)buf);
 
-	      motorA(-3000);
-	      motorB(-3000);
-	      HAL_Delay(2000);
+      sprintf(buf, "9:%lu %lu      ", TIM9->CCR1, TIM9->CCR2);
+      OLED_ShowString(0, 32, (uint8_t *)buf);
 
-	      motors_stop();
-	      HAL_Delay(2000);
+      sprintf(buf, "R%lu %lu C%d%d", TIM4->ARR, TIM9->ARR,
+              (TIM4->CR1 & TIM_CR1_CEN) ? 1 : 0,
+              (TIM9->CR1 & TIM_CR1_CEN) ? 1 : 0);
+      OLED_ShowString(0, 48, (uint8_t *)buf);
+
+      OLED_Refresh_Gram();
+      HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin);
+
+      HAL_Delay(3000);
+      stage = (stage + 1) % 4;
   }
   /* USER CODE END 3 */
 }
-
 /**
   * @brief System Clock Configuration
   * @retval None
@@ -308,7 +329,7 @@ static void MX_TIM4_Init(void)
   htim4.Instance = TIM4;
   htim4.Init.Prescaler = 0;
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 65535;
+  htim4.Init.Period = 7199;
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
@@ -346,52 +367,6 @@ static void MX_TIM4_Init(void)
 
   /* USER CODE END TIM4_Init 2 */
   HAL_TIM_MspPostInit(&htim4);
-
-}
-
-/**
-  * @brief TIM8 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM8_Init(void)
-{
-
-  /* USER CODE BEGIN TIM8_Init 0 */
-
-  /* USER CODE END TIM8_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM8_Init 1 */
-
-  /* USER CODE END TIM8_Init 1 */
-  htim8.Instance = TIM8;
-  htim8.Init.Prescaler = 0;
-  htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim8.Init.Period = 7199;
-  htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim8.Init.RepetitionCounter = 0;
-  htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim8, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM8_Init 2 */
-
-  /* USER CODE END TIM8_Init 2 */
 
 }
 
@@ -564,36 +539,22 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOE, OLED3_Pin|OLED4_Pin|LED_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, Buzzer_Pin|DIN1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOE, LED3_Pin|MOTC_IN2_Pin|MOTC_IN1_Pin|MOTD_IN2_Pin
+                          |MOTD_IN1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD, GPIO_PIN_11|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : OLED3_Pin OLED4_Pin LED_Pin */
-  GPIO_InitStruct.Pin = OLED3_Pin|OLED4_Pin|LED_Pin;
+  /*Configure GPIO pins : LED3_Pin MOTC_IN2_Pin MOTC_IN1_Pin MOTD_IN2_Pin
+                           MOTD_IN1_Pin */
+  GPIO_InitStruct.Pin = LED3_Pin|MOTC_IN2_Pin|MOTC_IN1_Pin|MOTD_IN2_Pin
+                          |MOTD_IN1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : Buzzer_Pin DIN1_Pin */
-  GPIO_InitStruct.Pin = Buzzer_Pin|DIN1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : USER_PB_Pin */
-  GPIO_InitStruct.Pin = USER_PB_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(USER_PB_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PD11 PD12 PD13 PD14 */
   GPIO_InitStruct.Pin = GPIO_PIN_11|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14;
@@ -602,22 +563,26 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : IMU_INT_Pin */
-  GPIO_InitStruct.Pin = IMU_INT_Pin;
+  /*Configure GPIO pins : USER_BTN_Pin IMU_INT_Pin */
+  GPIO_InitStruct.Pin = USER_BTN_Pin|IMU_INT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(IMU_INT_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
   HAL_NVIC_SetPriority(EXTI1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI1_IRQn);
-
-  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_GPIO_EXTI_Callback(uint16_t pin)
+{
+    if (pin == USER_BTN_Pin) btn_pressed = 1;
+}
 
 /* USER CODE END 4 */
 

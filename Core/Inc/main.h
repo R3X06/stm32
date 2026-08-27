@@ -59,19 +59,23 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define OLED3_Pin GPIO_PIN_7
-#define OLED3_GPIO_Port GPIOE
-#define OLED4_Pin GPIO_PIN_8
-#define OLED4_GPIO_Port GPIOE
-#define LED_Pin GPIO_PIN_10
-#define LED_GPIO_Port GPIOE
-#define Buzzer_Pin GPIO_PIN_10
-#define Buzzer_GPIO_Port GPIOB
-#define DIN1_Pin GPIO_PIN_11
-#define DIN1_GPIO_Port GPIOB
-#define USER_PB_Pin GPIO_PIN_8
-#define USER_PB_GPIO_Port GPIOD
-#define USER_PB_EXTI_IRQn EXTI9_5_IRQn
+#define LED3_Pin GPIO_PIN_8
+#define LED3_GPIO_Port GPIOE
+#define MOTC_IN2_Pin GPIO_PIN_9
+#define MOTC_IN2_GPIO_Port GPIOE
+#define MOTC_IN1_Pin GPIO_PIN_11
+#define MOTC_IN1_GPIO_Port GPIOE
+#define MOTD_IN2_Pin GPIO_PIN_13
+#define MOTD_IN2_GPIO_Port GPIOE
+#define MOTD_IN1_Pin GPIO_PIN_14
+#define MOTD_IN1_GPIO_Port GPIOE
+#define MOTA_IN2_Pin GPIO_PIN_8
+#define MOTA_IN2_GPIO_Port GPIOB
+#define MOTA_IN1_Pin GPIO_PIN_9
+#define MOTA_IN1_GPIO_Port GPIOB
+#define USER_BTN_Pin GPIO_PIN_0
+#define USER_BTN_GPIO_Port GPIOE
+#define USER_BTN_EXTI_IRQn EXTI0_IRQn
 #define IMU_INT_Pin GPIO_PIN_1
 #define IMU_INT_GPIO_Port GPIOE
 #define IMU_INT_EXTI_IRQn EXTI1_IRQn

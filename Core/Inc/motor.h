@@ -3,22 +3,20 @@
  *
  * Motor + encoder driver for WHEELTEC C30D V2.1 (STM32F407VET6)
  *
- * Topology: PWM / PWM  (AT8236 dual-input H-bridge, NO enable pin)
- *   Forward : PWM on IN1, IN2 held low
- *   Reverse : IN1 held low, PWM on IN2
- *   Stop    : both low (coast)
+ * Topology: AT8236 dual-input H-bridge, PWM/PWM, fast decay.
+ *   Forward : PWM on one input, other held at 0
+ *   Reverse : swap which input is PWM'd
+ *   Stop    : both 0 (coast)
  *
- * Verified against the C30D schematic:
- *   U8 -> AOUT1/AOUT2 (Motor A) : IN pins PB8 / PB9
- *   U9 -> BOUT1/BOUT2 (Motor B) : IN pins PE5 / PE6
+ * Pin map verified against C30D V2.1 schematic sheet 3/3:
+ *   U8 (Motor A) : IN1 = PB9 (TIM4_CH4), IN2 = PB8 (TIM4_CH3)
+ *   U9 (Motor B) : IN1 = PE5 (TIM9_CH1), IN2 = PE6 (TIM9_CH2)
+ *   Encoder A    : TIM2  PA15 / PB3      (32-bit, ARR forced to 65535)
+ *   Encoder B    : TIM3  PB4  / PB5      (16-bit)
  *
- *   Motor A drive   : TIM4_CH3 (PB8), TIM4_CH4 (PB9)
- *   Motor B drive   : TIM9_CH1 (PE5), TIM9_CH2 (PE6)
- *   Motor A encoder : TIM2 (PA15/PB3)
- *   Motor B encoder : TIM3 (PB4/PB5)
- *
- * PC6/PC7/PA2/PA3/PA4/PA5 are NOT connected to any motor driver on this
- * board revision. The Lab_4 pin map was for a different board.
+ * Clock: HSE 8 MHz -> PLL(M=4,N=72,P=2) -> 72 MHz SYSCLK.
+ * APB1 /2 and APB2 /1 both yield a 72 MHz timer clock, so TIM4 and TIM9
+ * share an identical timebase. ARR 7199 -> 10 kHz PWM on both motors.
  */
 
 #ifndef INC_MOTOR_H_
@@ -26,27 +24,22 @@
 
 #include "main.h"
 
-/* ARR = 7199 @ 72 MHz timer clock -> 10 kHz PWM */
-#define PWM_MAX  7199
-#define PWM_MIN  1000   /* below this the motor stalls */
+#define PWM_MAX        7199   /* = ARR. 100% duty */
+#define PWM_DEADBAND   1000   /* below this the motor stalls, don't bother */
 
-#define TICKS_PER_REV  260
+/* PROVISIONAL - must be measured. Reference repo uses 330 PPR x4 = 1320.
+ * Mark a wheel, rotate exactly 10 turns by hand, read encA_count()/10. */
+#define TICKS_PER_REV  1320
+#define WHEEL_DIAM_CM  5.7f
 
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim4;
 extern TIM_HandleTypeDef htim9;
 
-/* Start all PWM channels + encoders, force both motors to coast.
- * Call once from USER CODE BEGIN 2, after the MX_*_Init() calls. */
 void motors_init(void);
-
-/* Signed PWM. Positive = one direction, negative = the other, 0 = coast.
- * Magnitude clamped to PWM_MAX. If a wheel turns the wrong way, swap the
- * two channel constants for that motor in motor.c. */
-void motorA(int16_t pwm);
+void motorA(int16_t pwm);      /* signed; 0 = coast, sign = direction */
 void motorB(int16_t pwm);
-
 void motors_stop(void);
 
 uint16_t encA_count(void);
