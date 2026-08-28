@@ -49,6 +49,8 @@ extern "C" {
 
 /* USER CODE END EM */
 
+void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
+
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
 
@@ -57,6 +59,10 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define Bin1_Pin GPIO_PIN_5
+#define Bin1_GPIO_Port GPIOE
+#define Bin2_Pin GPIO_PIN_6
+#define Bin2_GPIO_Port GPIOE
 #define LED3_Pin GPIO_PIN_8
 #define LED3_GPIO_Port GPIOE
 #define OLED_DC_Pin GPIO_PIN_11
@@ -67,6 +73,26 @@ void Error_Handler(void);
 #define OLED_SDA_GPIO_Port GPIOD
 #define OLED_SCL_Pin GPIO_PIN_14
 #define OLED_SCL_GPIO_Port GPIOD
+#define SERVO_PWM_1_Pin GPIO_PIN_6
+#define SERVO_PWM_1_GPIO_Port GPIOC
+#define SERVO_PWM_2_Pin GPIO_PIN_7
+#define SERVO_PWM_2_GPIO_Port GPIOC
+#define SERVO_PWM_3_Pin GPIO_PIN_8
+#define SERVO_PWM_3_GPIO_Port GPIOC
+#define SERVO_PWM_4_Pin GPIO_PIN_9
+#define SERVO_PWM_4_GPIO_Port GPIOC
+#define ENCODER_A1_Pin GPIO_PIN_15
+#define ENCODER_A1_GPIO_Port GPIOA
+#define ENCODER_A2_Pin GPIO_PIN_3
+#define ENCODER_A2_GPIO_Port GPIOB
+#define ENCODER_B1_Pin GPIO_PIN_4
+#define ENCODER_B1_GPIO_Port GPIOB
+#define ENCODER_B2_Pin GPIO_PIN_5
+#define ENCODER_B2_GPIO_Port GPIOB
+#define Ain2_Pin GPIO_PIN_8
+#define Ain2_GPIO_Port GPIOB
+#define Ain1_Pin GPIO_PIN_9
+#define Ain1_GPIO_Port GPIOB
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
