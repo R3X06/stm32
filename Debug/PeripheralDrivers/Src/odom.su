@@ -1,0 +1,14 @@
+../PeripheralDrivers/Src/odom.c:28:14:wrap180	16	static
+../PeripheralDrivers/Src/odom.c:35:14:clampf	24	static
+../PeripheralDrivers/Src/odom.c:46:6:Odom_Init	8	static
+../PeripheralDrivers/Src/odom.c:58:6:Odom_Reset	4	static
+../PeripheralDrivers/Src/odom.c:66:6:Odom_Update	48	static
+../PeripheralDrivers/Src/odom.c:121:6:Odom_GetPose	16	static
+../PeripheralDrivers/Src/odom.c:129:7:Odom_GetHeading	4	static
+../PeripheralDrivers/Src/odom.c:130:7:Odom_GetDistance	4	static
+../PeripheralDrivers/Src/odom.c:131:7:Odom_GetTrim	4	static
+../PeripheralDrivers/Src/odom.c:137:6:Odom_DriveStraight	16	static
+../PeripheralDrivers/Src/odom.c:142:6:Odom_DriveHeading	16	static
+../PeripheralDrivers/Src/odom.c:150:6:Odom_Stop	8	static
+../PeripheralDrivers/Src/odom.c:161:6:Odom_CalibrateSpinStart	8	static
+../PeripheralDrivers/Src/odom.c:167:7:Odom_CalibrateSpinResult	24	static

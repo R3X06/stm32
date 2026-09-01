@@ -1,0 +1,13 @@
+../PeripheralDrivers/Src/motors.c:12:17:speed_to_ccr	24	static
+../PeripheralDrivers/Src/motors.c:25:13:motor_drive	32	static
+../PeripheralDrivers/Src/motors.c:52:6:Motors_Init	8	static
+../PeripheralDrivers/Src/motors.c:67:6:Motor_A_Set	16	static
+../PeripheralDrivers/Src/motors.c:75:6:Motor_B_Set	16	static
+../PeripheralDrivers/Src/motors.c:83:6:Motor_A_Brake	4	static
+../PeripheralDrivers/Src/motors.c:91:6:Motor_B_Brake	4	static
+../PeripheralDrivers/Src/motors.c:97:6:Motors_Brake	8	static
+../PeripheralDrivers/Src/motors.c:103:6:Motors_Coast	8	static
+../PeripheralDrivers/Src/motors.c:113:6:Servos_Init	8	static
+../PeripheralDrivers/Src/motors.c:128:6:Servo_SetMicroseconds	16	static
+../PeripheralDrivers/Src/motors.c:143:6:Servo_SetAngle	24	static
+../PeripheralDrivers/Src/motors.c:162:6:Motors_TestSequence	16	static

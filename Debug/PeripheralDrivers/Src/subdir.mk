@@ -5,13 +5,25 @@
 
 # Add inputs and outputs from these tool invocations to the build variables 
 C_SRCS += \
-../PeripheralDrivers/Src/oled.c 
+../PeripheralDrivers/Src/encoders.c \
+../PeripheralDrivers/Src/motors.c \
+../PeripheralDrivers/Src/odom.c \
+../PeripheralDrivers/Src/oled.c \
+../PeripheralDrivers/Src/pid.c 
 
 OBJS += \
-./PeripheralDrivers/Src/oled.o 
+./PeripheralDrivers/Src/encoders.o \
+./PeripheralDrivers/Src/motors.o \
+./PeripheralDrivers/Src/odom.o \
+./PeripheralDrivers/Src/oled.o \
+./PeripheralDrivers/Src/pid.o 
 
 C_DEPS += \
-./PeripheralDrivers/Src/oled.d 
+./PeripheralDrivers/Src/encoders.d \
+./PeripheralDrivers/Src/motors.d \
+./PeripheralDrivers/Src/odom.d \
+./PeripheralDrivers/Src/oled.d \
+./PeripheralDrivers/Src/pid.d 
 
 
 # Each subdirectory must supply rules for building sources it contributes
@@ -21,7 +33,7 @@ PeripheralDrivers/Src/%.o PeripheralDrivers/Src/%.su: ../PeripheralDrivers/Src/%
 clean: clean-PeripheralDrivers-2f-Src
 
 clean-PeripheralDrivers-2f-Src:
-	-$(RM) ./PeripheralDrivers/Src/oled.d ./PeripheralDrivers/Src/oled.o ./PeripheralDrivers/Src/oled.su
+	-$(RM) ./PeripheralDrivers/Src/encoders.d ./PeripheralDrivers/Src/encoders.o ./PeripheralDrivers/Src/encoders.su ./PeripheralDrivers/Src/motors.d ./PeripheralDrivers/Src/motors.o ./PeripheralDrivers/Src/motors.su ./PeripheralDrivers/Src/odom.d ./PeripheralDrivers/Src/odom.o ./PeripheralDrivers/Src/odom.su ./PeripheralDrivers/Src/oled.d ./PeripheralDrivers/Src/oled.o ./PeripheralDrivers/Src/oled.su ./PeripheralDrivers/Src/pid.d ./PeripheralDrivers/Src/pid.o ./PeripheralDrivers/Src/pid.su
 
 .PHONY: clean-PeripheralDrivers-2f-Src
 

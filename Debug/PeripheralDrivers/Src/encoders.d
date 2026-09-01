@@ -1,4 +1,5 @@
-Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
+PeripheralDrivers/Src/encoders.o: ../PeripheralDrivers/Src/encoders.c \
+ C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/encoders.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h \
  ../Core/Inc/stm32f4xx_hal_conf.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_rcc.h \
@@ -25,13 +26,8 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_pwr.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_pwr_ex.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim.h \
- ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim_ex.h \
- C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/oled.h \
- C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/motors.h \
- C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/encoders.h \
- C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/pid.h \
- C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/odom.h
-../Core/Inc/main.h:
+ ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim_ex.h
+C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/encoders.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h:
 ../Core/Inc/stm32f4xx_hal_conf.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_rcc.h:
@@ -59,8 +55,3 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_pwr_ex.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim_ex.h:
-C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/oled.h:
-C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/motors.h:
-C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/encoders.h:
-C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/pid.h:
-C:/Users/Dell/Documents/CEG/Y3S1/MDPX/STM32X/PeripheralDrivers/Inc/odom.h:
