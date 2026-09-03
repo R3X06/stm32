@@ -27,6 +27,7 @@
 #include "encoders.h"
 #include "pid.h"
 #include "odom.h"
+#include "calib.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -123,12 +124,10 @@ int main(void)
   Encoders_Init();
   HAL_TIM_Base_Start_IT(&htim6);
   PID_Init();
-  PID_Enable(0);          // open loop for the bring-up test
+  PID_Enable(0);
   Odom_Init();
-
-  Motors_TestSequence();  // TEMPORARY - Phase 1 regression only
-
-  Motors_Coast();
+  Calib_Init();
+  Calib_Run();          /* PHASE 2 ONLY - never returns */
   /* USER CODE END 2 */
 
   /* Infinite loop */
