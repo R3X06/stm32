@@ -91,8 +91,8 @@
  * handout the working span is roughly 65-85 ticks at 20 us, i.e. 1300-1700.
  * Commanding 500 or 2500 drives the steering into its mechanical stop and
  * stalls the servo. All three values are PROVISIONAL - measured in Phase 2. */
-#define SERVO_MIN_US        1300U
-#define SERVO_MAX_US        1700U
+#define SERVO_MIN_US        1250U
+#define SERVO_MAX_US        1750U
 #define SERVO_CENTER_US     1500U
 
 

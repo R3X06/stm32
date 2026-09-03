@@ -20,7 +20,7 @@
 #define CALIB_MODE_ENDSTOP  0   /* linkage DETACHED - find the limits    */
 #define CALIB_MODE_CENTRE   1   /* linkage ATTACHED - find straight      */
 
-#define CALIB_MODE          CALIB_MODE_ENDSTOP
+#define CALIB_MODE          CALIB_MODE_CENTRE
 
 /* Search span. Deliberately wider than SERVO_MIN_US/SERVO_MAX_US because the
  * whole point of endstop mode is to find where those should be. The harness
@@ -29,8 +29,8 @@
  *
  * Once you have the real limits, narrow these to match before running
  * centre mode with the linkage on. */
-#define CALIB_SPAN_MIN_US   1200U
-#define CALIB_SPAN_MAX_US   1800U
+#define CALIB_SPAN_MIN_US   1400U
+#define CALIB_SPAN_MAX_US   1600U
 #define CALIB_STEP_US       10U
 
 /* Run parameters for centre mode. */

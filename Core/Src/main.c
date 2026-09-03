@@ -57,9 +57,9 @@ UART_HandleTypeDef huart3;
 /* USER CODE BEGIN PV */
 volatile struct {
     int16_t heading_deg;
-    int16_t trim;
-    int16_t pid_out_a;
-    int16_t pid_out_b;
+    int16_t error_deg;
+    int16_t servo_us;
+    int16_t dist_mm;
 } g_tlm;
 /* USER CODE END PV */
 
@@ -79,7 +79,46 @@ static void MX_USART3_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#define BTN_DOWN()  (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_0) == GPIO_PIN_RESET)
 
+static void Tlm(void)
+{
+    char line[24];
+    g_tlm.heading_deg = (int16_t)Odom_GetHeading();
+    g_tlm.error_deg   = (int16_t)Odom_GetHeadingError();
+    g_tlm.servo_us    = (int16_t)Odom_GetServoUs();
+    g_tlm.dist_mm     = (int16_t)Odom_GetDistance();
+
+    snprintf(line, sizeof(line), "HD%4d ER%4d", g_tlm.heading_deg, g_tlm.error_deg);
+    OLED_ShowString(0, 0, (const uint8_t *)line);
+    snprintf(line, sizeof(line), "SV%4d D%5d", g_tlm.servo_us, g_tlm.dist_mm);
+    OLED_ShowString(0, 16, (const uint8_t *)line);
+    OLED_Refresh_Gram();
+}
+
+static void Run2m(void)
+{
+    uint32_t t0 = HAL_GetTick();
+
+    Odom_Stop();
+    Encoders_Reset();
+    Odom_Reset();
+    PID_Enable(1);
+    Odom_DriveStraight(150);
+
+    while ((Odom_GetDistance() < 2000.0f) && ((HAL_GetTick() - t0) < 12000U))
+    {
+        Tlm();
+        HAL_Delay(50);
+    }
+
+    Odom_Stop();
+    Motors_Brake();
+    HAL_Delay(400);
+    PID_Enable(0);
+    Motors_Coast();
+    Tlm();
+}
 /* USER CODE END 0 */
 
 /**
@@ -126,31 +165,23 @@ int main(void)
   PID_Init();
   PID_Enable(0);
   Odom_Init();
-  Calib_Init();
-  Calib_Run();          /* PHASE 2 ONLY - never returns */
+  Calib_Init();          /* configures PE0, parks servo at centre */
   /* USER CODE END 2 */
 
-  /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  char line[24];
-
-	  //Encoders_Update();
-
-	  snprintf(line, sizeof(line), "HD%5d TR%4d", g_tlm.heading_deg, g_tlm.trim);
-	  OLED_ShowString(0, 0, (const uint8_t *)line);
-	  snprintf(line, sizeof(line), "OA%5d OB%4d", g_tlm.pid_out_a, g_tlm.pid_out_b);
-	  OLED_ShowString(0, 16, (const uint8_t *)line);
-	  OLED_Refresh_Gram();
-
-	  HAL_Delay(50);
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
+      if (BTN_DOWN())
+      {
+          while (BTN_DOWN()) { HAL_Delay(10); }   /* wait for release */
+          Run2m();
+      }
+      Tlm();
+      HAL_Delay(50);
   }
   /* USER CODE END 3 */
 }
+
 
 /**
   * @brief System Clock Configuration
