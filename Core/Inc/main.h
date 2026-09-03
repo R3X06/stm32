@@ -73,14 +73,6 @@ void Error_Handler(void);
 #define OLED_SDA_GPIO_Port GPIOD
 #define OLED_SCL_Pin GPIO_PIN_14
 #define OLED_SCL_GPIO_Port GPIOD
-#define SERVO_PWM_1_Pin GPIO_PIN_6
-#define SERVO_PWM_1_GPIO_Port GPIOC
-#define SERVO_PWM_2_Pin GPIO_PIN_7
-#define SERVO_PWM_2_GPIO_Port GPIOC
-#define SERVO_PWM_3_Pin GPIO_PIN_8
-#define SERVO_PWM_3_GPIO_Port GPIOC
-#define SERVO_PWM_4_Pin GPIO_PIN_9
-#define SERVO_PWM_4_GPIO_Port GPIOC
 #define ENCODER_A1_Pin GPIO_PIN_15
 #define ENCODER_A1_GPIO_Port GPIOA
 #define ENCODER_A2_Pin GPIO_PIN_3

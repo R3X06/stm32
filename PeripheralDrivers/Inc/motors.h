@@ -6,15 +6,18 @@
 /* ---------------------------------------------------------------------------
  * Board: WHEELTEC STM32F407VET6 C30D-V2 (schematic rev 23.0)
  *
+ * Ackermann chassis: the two rear wheels drive, the front axle is steered by
+ * a single servo. The robot CANNOT turn on the spot - every turn is an arc.
+ *
  * Four onboard AT8236 H-bridges. This driver uses the first two.
  *
- *   Motor A  = U8,  header MOTORA
+ *   Motor A  = U8,  header MOTORA   (left rear)
  *       drive   PB8, PB9   -> TIM4_CH3, TIM4_CH4   (AF2)
- *   Motor B  = U9,  header MOTORB
+ *   Motor B  = U9,  header MOTORB   (right rear)
  *       drive   PE5, PE6   -> TIM9_CH1, TIM9_CH2   (AF3)
  *
- *   Servos   = headers J1/J2/J4/J5
- *       PC6, PC7, PC8, PC9 -> TIM8_CH1..CH4        (AF3)
+ *   Steering servo, header per Robot car test V30D:
+ *       PB15       -> TIM12_CH2                    (AF9)
  *       Powered from the 5V5 rail (U7), separate from the Pi 5V supply.
  *
  * The AT8236 has no direction pin. Direction comes from which of the two
@@ -26,6 +29,17 @@
  *
  * Which physical direction is "forward" depends on how the motor leads are
  * crimped, so check on the bench and flip the INVERT flags below if needed.
+ *
+ * ---------------------------------------------------------------------------
+ * PINS DELIBERATELY LEFT FREE - do not use:
+ *
+ *   PC6, PC7   HC-SR04 trig + echo (TIM8_CH2 capture)   - Person B
+ *   PB10, PB11 I2C2, ICM20948 IMU                       - Person B
+ *
+ * Note PB10/PB11 are also USART3_TX/RX on AF7. USART3 must stay on PD8/PD9
+ * or it takes the IMU bus, and the failure looks nothing like a pin clash.
+ *
+ * PB14 is TIM12_CH1 - a second servo can go there later at no timer cost.
  *
  * ---------------------------------------------------------------------------
  * NOT USED HERE, but noted so you do not trip over it later:
@@ -41,14 +55,17 @@
  * CLOCK ASSUMPTION
  *
  * Values below assume HSE 8 MHz crystal -> PLL -> 168 MHz SYSCLK,
- * APB1 prescaler 4 (TIM4 clock 84 MHz), APB2 prescaler 2 (TIM8/TIM9 168 MHz).
+ * APB1 prescaler 4 (TIM4/TIM12 clock 84 MHz), APB2 prescaler 2 (TIM9 168 MHz).
  *
- *   TIM4: PSC = 0,   ARR = 4199   -> 84 MHz / 4200 = 20 kHz
- *   TIM9: PSC = 1,   ARR = 4199   -> 84 MHz / 4200 = 20 kHz  (same scale)
- *   TIM8: PSC = 167, ARR = 19999  ->  1 MHz / 20000 = 50 Hz, 1 us resolution
+ *   TIM4:  PSC = 0,   ARR = 4199   -> 84 MHz / 4200  = 20 kHz
+ *   TIM9:  PSC = 1,   ARR = 4199   -> 84 MHz / 4200  = 20 kHz  (same scale)
+ *   TIM12: PSC = 83,  ARR = 19999  ->  1 MHz / 20000 = 50 Hz, 1 us resolution
+ *
+ * TIM12 is a general-purpose timer, 16-bit, two channels, no complementary
+ * outputs - so unlike TIM8 there is no MOE to enable before PWM appears.
  *
  * If you stay on the default HSI 16 MHz with no PLL, use instead:
- *   TIM4 PSC 0 ARR 799, TIM9 PSC 0 ARR 799, TIM8 PSC 15 ARR 19999,
+ *   TIM4 PSC 0 ARR 799, TIM9 PSC 0 ARR 799, TIM12 PSC 15 ARR 19999,
  * and change MOTOR_TIM_ARR below to 799.
  * ------------------------------------------------------------------------- */
 
@@ -69,18 +86,15 @@
 #define MOTOR_A_INVERT      1
 #define MOTOR_B_INVERT      1
 
-/* Servo pulse limits in microseconds. 500-2500 suits MG996R / SG90 class
- * servos. Narrow to 1000/2000 if yours buzzes at the extremes - a servo held
- * past its mechanical stop draws stall current until it burns out. */
-#define SERVO_MIN_US        500U
-#define SERVO_MAX_US        2500U
+/* Servo pulse limits, microseconds.
+ * The linkage - not the servo - sets the usable range. Per the datasheet
+ * handout the working span is roughly 65-85 ticks at 20 us, i.e. 1300-1700.
+ * Commanding 500 or 2500 drives the steering into its mechanical stop and
+ * stalls the servo. All three values are PROVISIONAL - measured in Phase 2. */
+#define SERVO_MIN_US        1300U
+#define SERVO_MAX_US        1700U
 #define SERVO_CENTER_US     1500U
 
-/* Which TIM8 channel each servo header pin maps to. */
-#define SERVO_PC6           TIM_CHANNEL_1
-#define SERVO_PC7           TIM_CHANNEL_2
-#define SERVO_PC8           TIM_CHANNEL_3
-#define SERVO_PC9           TIM_CHANNEL_4
 
 void Motors_Init(void);
 
@@ -96,12 +110,16 @@ void Motors_Brake(void);
 /* Both inputs low - outputs float, motor freewheels. */
 void Motors_Coast(void);
 
-/* Starts all four TIM8 servo channels at centre. */
+/* Starts the steering servo on TIM12_CH2, held at centre. */
 void Servos_Init(void);
 
-/* channel: one of the SERVO_PCx constants above. */
-void Servo_SetMicroseconds(uint32_t channel, uint16_t us);
-void Servo_SetAngle(uint32_t channel, uint8_t degrees);
+/* Pulse width in microseconds, clamped to SERVO_MIN_US..SERVO_MAX_US. */
+void Servo_SetMicroseconds(uint16_t us);
+
+/* 0..180 mapped linearly across the clamped range. 90 is NOT the straight-
+ * ahead position unless SERVO_CENTER_US happens to sit mid-range - use
+ * Servo_SetMicroseconds(SERVO_CENTER_US) to centre the steering. */
+void Servo_SetAngle(uint8_t degrees);
 
 /* Blocking bring-up sequence. Chassis on blocks before calling. */
 void Motors_TestSequence(void);
