@@ -1,0 +1,31 @@
+# ---- STM32CubeIDE build output ----
+Debug/
+Release/
+*.o
+*.d
+*.su
+*.elf
+*.bin
+*.map
+*.list
+*.cyclo
+
+# The .hex IS the flashing artefact for FlyMcu.
+# Keep it out of git anyway - regenerate it, don't merge it.
+*.hex
+
+# ---- CubeIDE / Eclipse workspace state ----
+.metadata/
+RemoteSystemsTempFiles/
+.settings/language.settings.xml
+*.launch
+
+# ---- CubeMX backups ----
+*.ioc.bak
+*.bak
+.mxproject
+
+# ---- OS noise ----
+.DS_Store
+Thumbs.db
+desktop.ini
