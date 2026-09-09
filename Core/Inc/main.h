@@ -63,8 +63,14 @@ void Error_Handler(void);
 #define Bin1_GPIO_Port GPIOE
 #define Bin2_Pin GPIO_PIN_6
 #define Bin2_GPIO_Port GPIOE
+#define IR_L_Pin GPIO_PIN_0
+#define IR_L_GPIO_Port GPIOC
+#define IR_R_Pin GPIO_PIN_1
+#define IR_R_GPIO_Port GPIOC
 #define LED3_Pin GPIO_PIN_8
 #define LED3_GPIO_Port GPIOE
+#define US_Trig_Pin GPIO_PIN_14
+#define US_Trig_GPIO_Port GPIOB
 #define OLED_DC_Pin GPIO_PIN_11
 #define OLED_DC_GPIO_Port GPIOD
 #define OLED_RES_Pin GPIO_PIN_12
@@ -73,6 +79,8 @@ void Error_Handler(void);
 #define OLED_SDA_GPIO_Port GPIOD
 #define OLED_SCL_Pin GPIO_PIN_14
 #define OLED_SCL_GPIO_Port GPIOD
+#define US_Echo_Pin GPIO_PIN_7
+#define US_Echo_GPIO_Port GPIOC
 #define ENCODER_A1_Pin GPIO_PIN_15
 #define ENCODER_A1_GPIO_Port GPIOA
 #define ENCODER_A2_Pin GPIO_PIN_3

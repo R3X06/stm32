@@ -2,204 +2,268 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
+  * @brief          : HC-SR04 ISOLATION TEST BUILD
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
+  *  Brings up ONLY: clocks, OLED, PB14 (trig), PC7 (echo, TIM8_CH2).
+  *  Motors are held in coast (both H-bridge inputs low, no PWM).
+  *  Servo, encoders, PID, odometry, ADC/IR and the TIM6 control tick
+  *  are all left out, so the 5V rail carries almost nothing.
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  *  If the ultrasonic works here but not in the full build, the problem
+  *  is power. If it fails here too, it is the sensor or its wiring.
   ******************************************************************************
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include "oled.h"
-#include "motors.h"
-#include "encoders.h"
-#include "pid.h"
-#include "odom.h"
-#include "calib.h"
-/* USER CODE END Includes */
-
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
-
-/* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
+#define US_TRIG_PORT   GPIOB
+#define US_TRIG_PIN    GPIO_PIN_14
+#define US_ECHO_PORT   GPIOC
+#define US_ECHO_PIN    GPIO_PIN_7
 
 /* Private variables ---------------------------------------------------------*/
- TIM_HandleTypeDef htim2;
-TIM_HandleTypeDef htim3;
-TIM_HandleTypeDef htim4;
-TIM_HandleTypeDef htim6;
-TIM_HandleTypeDef htim9;
-TIM_HandleTypeDef htim12;
+TIM_HandleTypeDef htim8;
 
+/* Unused here, but stm32f4xx_it.c references them. Never initialised,
+   so the peripherals stay off and their interrupts never fire.        */
+TIM_HandleTypeDef  htim6;
 UART_HandleTypeDef huart3;
+DMA_HandleTypeDef  hdma_adc1;
 
-/* USER CODE BEGIN PV */
-volatile struct {
-    int16_t heading_deg;
-    int16_t error_deg;
-    int16_t servo_us;
-    int16_t dist_mm;
-} g_tlm;
-/* USER CODE END PV */
+volatile uint16_t us_t1        = 0;
+volatile uint16_t us_echo_us   = 0;    /* width from capture path  */
+volatile uint16_t us_poll_us   = 0;    /* width from polled path   */
+volatile float    us_distance_cm = -1.0f;
+volatile uint8_t  us_waiting   = 0;
+volatile uint8_t  us_edge      = 0;
+volatile uint8_t  us_pin_high  = 0;
+volatile uint16_t us_poll_ok   = 0;
+volatile uint16_t us_isr_n     = 0;
+volatile uint16_t loop_n       = 0;
+
+volatile uint8_t  pin_pu = 9, pin_pd = 9;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_TIM2_Init(void);
-static void MX_TIM3_Init(void);
-static void MX_TIM4_Init(void);
-static void MX_TIM9_Init(void);
-static void MX_TIM6_Init(void);
-static void MX_TIM12_Init(void);
-static void MX_USART3_UART_Init(void);
-/* USER CODE BEGIN PFP */
+static void MX_TIM8_Init(void);
+static void Pins_Init(void);
+static void Motors_Safe(void);
+static uint8_t PC7_Read(uint32_t pull);
+static void HCSR04_Trigger(void);
+static void HCSR04_Poll(void);
+static void Show(void);
 
-/* USER CODE END PFP */
+/* ---------------------------------------------------------------------------*/
 
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
-#define BTN_DOWN()  (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_0) == GPIO_PIN_RESET)
+/* Both H-bridge inputs low on each motor = coast. No PWM anywhere.
+   Servo signal pin held low so the servo receives no pulses.        */
+static void Motors_Safe(void)
+{
+    GPIO_InitTypeDef g = {0};
 
-static void Tlm(void)
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+
+    g.Mode  = GPIO_MODE_OUTPUT_PP;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+
+    g.Pin = GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_15;   /* Ain2, Ain1, servo */
+    HAL_GPIO_Init(GPIOB, &g);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_15, GPIO_PIN_RESET);
+
+    g.Pin = GPIO_PIN_5 | GPIO_PIN_6;                 /* Bin1, Bin2 */
+    HAL_GPIO_Init(GPIOE, &g);
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_5 | GPIO_PIN_6, GPIO_PIN_RESET);
+}
+
+/* Read PC7 as a plain input with the requested internal pull. */
+static uint8_t PC7_Read(uint32_t pull)
+{
+    GPIO_InitTypeDef g = {0};
+
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    g.Pin   = US_ECHO_PIN;
+    g.Mode  = GPIO_MODE_INPUT;
+    g.Pull  = pull;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(US_ECHO_PORT, &g);
+    HAL_Delay(5);
+    return (HAL_GPIO_ReadPin(US_ECHO_PORT, US_ECHO_PIN) == GPIO_PIN_SET) ? 1u : 0u;
+}
+
+/* PB14 -> output (trig).  PC7 -> AF3 / TIM8_CH2 with pull-down (echo). */
+static void Pins_Init(void)
+{
+    GPIO_InitTypeDef g = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+
+    g.Pin   = US_TRIG_PIN;
+    g.Mode  = GPIO_MODE_OUTPUT_PP;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(US_TRIG_PORT, &g);
+    HAL_GPIO_WritePin(US_TRIG_PORT, US_TRIG_PIN, GPIO_PIN_RESET);
+
+    g.Pin       = US_ECHO_PIN;
+    g.Mode      = GPIO_MODE_AF_PP;
+    g.Pull      = GPIO_PULLDOWN;
+    g.Speed     = GPIO_SPEED_FREQ_LOW;
+    g.Alternate = GPIO_AF3_TIM8;
+    HAL_GPIO_Init(US_ECHO_PORT, &g);
+}
+
+static void HCSR04_Trigger(void)
+{
+    volatile uint32_t i;
+
+    us_edge     = 0;
+    us_waiting  = 1;
+    us_pin_high = 0;
+    __HAL_TIM_CLEAR_FLAG(&htim8, TIM_FLAG_CC2);
+    __HAL_TIM_CLEAR_FLAG(&htim8, TIM_FLAG_CC2OF);
+
+    HAL_GPIO_WritePin(US_TRIG_PORT, US_TRIG_PIN, GPIO_PIN_RESET);
+    for (i = 0; i < 150u;  i++) { __NOP(); }    /* ~5 us  settle */
+    HAL_GPIO_WritePin(US_TRIG_PORT, US_TRIG_PIN, GPIO_PIN_SET);
+    for (i = 0; i < 1000u; i++) { __NOP(); }    /* ~30 us pulse  */
+    HAL_GPIO_WritePin(US_TRIG_PORT, US_TRIG_PIN, GPIO_PIN_RESET);
+}
+
+/* Straight read of the pin. Does not use the capture unit or the NVIC. */
+static void HCSR04_Poll(void)
+{
+    uint32_t t0;
+    uint16_t a, b, w;
+
+    t0 = HAL_GetTick();
+    while (HAL_GPIO_ReadPin(US_ECHO_PORT, US_ECHO_PIN) == GPIO_PIN_RESET) {
+        if ((HAL_GetTick() - t0) > 30u) { us_waiting = 0; return; }
+    }
+    us_pin_high = 1;
+    a = (uint16_t)__HAL_TIM_GET_COUNTER(&htim8);
+
+    t0 = HAL_GetTick();
+    while (HAL_GPIO_ReadPin(US_ECHO_PORT, US_ECHO_PIN) == GPIO_PIN_SET) {
+        if ((HAL_GetTick() - t0) > 40u) { us_waiting = 0; return; }
+    }
+    b = (uint16_t)__HAL_TIM_GET_COUNTER(&htim8);
+
+    w = (uint16_t)(b - a);
+    us_poll_us = w;
+    if (w >= 100u && w <= 25000u) {
+        us_poll_ok++;
+        us_distance_cm = (float)w / 58.0f;
+    }
+    us_waiting = 0;
+}
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    uint16_t cap, w;
+
+    if (htim->Instance != TIM8) return;
+    if (htim->Channel != HAL_TIM_ACTIVE_CHANNEL_2) return;
+    us_isr_n++;
+
+    cap = (uint16_t)HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+    if (!us_waiting) return;
+
+    if (us_edge == 0) {
+        us_t1   = cap;
+        us_edge = 1;
+    } else {
+        w       = (uint16_t)(cap - us_t1);
+        us_edge = 0;
+        if (w >= 100u && w <= 25000u) us_echo_us = w;
+    }
+}
+
+static void Show(void)
 {
     char line[24];
-    g_tlm.heading_deg = (int16_t)Odom_GetHeading();
-    g_tlm.error_deg   = (int16_t)Odom_GetHeadingError();
-    g_tlm.servo_us    = (int16_t)Odom_GetServoUs();
-    g_tlm.dist_mm     = (int16_t)Odom_GetDistance();
 
-    snprintf(line, sizeof(line), "HD%4d ER%4d", g_tlm.heading_deg, g_tlm.error_deg);
+    snprintf(line, sizeof(line), "L%3d PU%d PD%d",
+             (int)(loop_n % 1000), (int)pin_pu, (int)pin_pd);
     OLED_ShowString(0, 0, (const uint8_t *)line);
-    snprintf(line, sizeof(line), "SV%4d D%5d", g_tlm.servo_us, g_tlm.dist_mm);
+
+    snprintf(line, sizeof(line), "H%d N%3d",
+             (int)us_pin_high, (int)(us_poll_ok % 1000));
     OLED_ShowString(0, 16, (const uint8_t *)line);
+
+    snprintf(line, sizeof(line), "P%5d D%4d",
+             (int)us_poll_us, (int)us_distance_cm);
+    OLED_ShowString(0, 32, (const uint8_t *)line);
+
+    snprintf(line, sizeof(line), "U%5d C%3d",
+             (int)us_echo_us, (int)(us_isr_n % 1000));
+    OLED_ShowString(0, 48, (const uint8_t *)line);
+
     OLED_Refresh_Gram();
 }
 
-static void Run2m(void)
-{
-    uint32_t t0 = HAL_GetTick();
+/* ---------------------------------------------------------------------------*/
 
-    Odom_Stop();
-    Encoders_Reset();
-    Odom_Reset();
-    PID_Enable(1);
-    Odom_DriveStraight(150);
-
-    while ((Odom_GetDistance() < 2000.0f) && ((HAL_GetTick() - t0) < 12000U))
-    {
-        Tlm();
-        HAL_Delay(50);
-    }
-
-    Odom_Stop();
-    Motors_Brake();
-    HAL_Delay(400);
-    PID_Enable(0);
-    Motors_Coast();
-    Tlm();
-}
-/* USER CODE END 0 */
-
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
+    HAL_Init();
+    SystemClock_Config();
 
-  /* USER CODE END 1 */
+    Motors_Safe();          /* hold the H-bridges in coast first */
 
-  /* MCU Configuration--------------------------------------------------------*/
+    {
+        GPIO_InitTypeDef g = {0};
+        __HAL_RCC_GPIOD_CLK_ENABLE();
+        g.Pin   = GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14;
+        g.Mode  = GPIO_MODE_OUTPUT_PP;
+        g.Pull  = GPIO_NOPULL;
+        g.Speed = GPIO_SPEED_FREQ_HIGH;
+        HAL_GPIO_Init(GPIOD, &g);
+        HAL_GPIO_WritePin(GPIOD, g.Pin, GPIO_PIN_RESET);
+    }
+    OLED_Init();
+    MX_TIM8_Init();
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+    pin_pu = PC7_Read(GPIO_PULLUP);
+    pin_pd = PC7_Read(GPIO_PULLDOWN);
 
-  /* USER CODE BEGIN Init */
+    Pins_Init();
+    HAL_TIM_IC_Start_IT(&htim8, TIM_CHANNEL_2);
 
-  /* USER CODE END Init */
+    while (1)
+    {
+        static uint32_t t_ping = 0, t_disp = 0;
 
-  /* Configure the system clock */
-  SystemClock_Config();
+        if (HAL_GetTick() - t_ping >= 100u) {
+            t_ping = HAL_GetTick();
+            loop_n++;
+            HCSR04_Trigger();
+            HCSR04_Poll();
+        }
 
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_TIM2_Init();
-  MX_TIM3_Init();
-  MX_TIM4_Init();
-  MX_TIM9_Init();
-  MX_TIM6_Init();
-  MX_TIM12_Init();
-  MX_USART3_UART_Init();
-  /* USER CODE BEGIN 2 */
-  OLED_Init();
-  Motors_Init();
-  Servos_Init();
-  Encoders_Init();
-  HAL_TIM_Base_Start_IT(&htim6);
-  PID_Init();
-  PID_Enable(0);
-  Odom_Init();
-  Calib_Init();          /* configures PE0, parks servo at centre */
-  /* USER CODE END 2 */
-
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-      if (BTN_DOWN())
-      {
-          while (BTN_DOWN()) { HAL_Delay(10); }   /* wait for release */
-          Run2m();
-      }
-      Tlm();
-      HAL_Delay(50);
-  }
-  /* USER CODE END 3 */
+        if (HAL_GetTick() - t_disp >= 200u) {
+            t_disp = HAL_GetTick();
+            Show();
+        }
+    }
 }
 
+/* ---------------------------------------------------------------------------*/
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -213,8 +277,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -228,395 +290,58 @@ void SystemClock_Config(void)
   }
 }
 
-/**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
+static void MX_TIM8_Init(void)
 {
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
 
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 65535;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 10;
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 10;
-  if (HAL_TIM_Encoder_Init(&htim2, &sConfig) != HAL_OK)
+  htim8.Instance = TIM8;
+  htim8.Init.Prescaler = 168-1;
+  htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim8.Init.Period = 65535;
+  htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim8.Init.RepetitionCounter = 0;
+  htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim8, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_IC_Init(&htim8) != HAL_OK)
   {
     Error_Handler();
   }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
-
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim8, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
-/**
-  * @brief TIM3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM3_Init(void)
-{
-
-  /* USER CODE BEGIN TIM3_Init 0 */
-
-  /* USER CODE END TIM3_Init 0 */
-
-  TIM_Encoder_InitTypeDef sConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM3_Init 1 */
-
-  /* USER CODE END TIM3_Init 1 */
-  htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 0;
-  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 65535;
-  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 10;
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 10;
-  if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM3_Init 2 */
-
-  /* USER CODE END TIM3_Init 2 */
-
-}
-
-/**
-  * @brief TIM4 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM4_Init(void)
-{
-
-  /* USER CODE BEGIN TIM4_Init 0 */
-
-  /* USER CODE END TIM4_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-
-  /* USER CODE BEGIN TIM4_Init 1 */
-
-  /* USER CODE END TIM4_Init 1 */
-  htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 0;
-  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 4199;
-  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM4_Init 2 */
-
-  /* USER CODE END TIM4_Init 2 */
-  HAL_TIM_MspPostInit(&htim4);
-
-}
-
-/**
-  * @brief TIM6 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM6_Init(void)
-{
-
-  /* USER CODE BEGIN TIM6_Init 0 */
-
-  /* USER CODE END TIM6_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM6_Init 1 */
-
-  /* USER CODE END TIM6_Init 1 */
-  htim6.Instance = TIM6;
-  htim6.Init.Prescaler = 8399;
-  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 99;
-  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM6_Init 2 */
-
-  /* USER CODE END TIM6_Init 2 */
-
-}
-
-/**
-  * @brief TIM9 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM9_Init(void)
-{
-
-  /* USER CODE BEGIN TIM9_Init 0 */
-
-  /* USER CODE END TIM9_Init 0 */
-
-  TIM_OC_InitTypeDef sConfigOC = {0};
-
-  /* USER CODE BEGIN TIM9_Init 1 */
-
-  /* USER CODE END TIM9_Init 1 */
-  htim9.Instance = TIM9;
-  htim9.Init.Prescaler = 1;
-  htim9.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim9.Init.Period = 4199;
-  htim9.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim9.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_PWM_Init(&htim9) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim9, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_ConfigChannel(&htim9, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM9_Init 2 */
-
-  /* USER CODE END TIM9_Init 2 */
-  HAL_TIM_MspPostInit(&htim9);
-
-}
-
-/**
-  * @brief TIM12 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM12_Init(void)
-{
-
-  /* USER CODE BEGIN TIM12_Init 0 */
-
-  /* USER CODE END TIM12_Init 0 */
-
-  TIM_OC_InitTypeDef sConfigOC = {0};
-
-  /* USER CODE BEGIN TIM12_Init 1 */
-
-  /* USER CODE END TIM12_Init 1 */
-  htim12.Instance = TIM12;
-  htim12.Init.Prescaler = 83;
-  htim12.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim12.Init.Period = 19999;
-  htim12.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim12.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_PWM_Init(&htim12) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 1500;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim12, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM12_Init 2 */
-
-  /* USER CODE END TIM12_Init 2 */
-  HAL_TIM_MspPostInit(&htim12);
-
-}
-
-/**
-  * @brief USART3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART3_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART3_Init 0 */
-
-  /* USER CODE END USART3_Init 0 */
-
-  /* USER CODE BEGIN USART3_Init 1 */
-
-  /* USER CODE END USART3_Init 1 */
-  huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
-  huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
-  huart3.Init.Mode = UART_MODE_TX_RX;
-  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART3_Init 2 */
-
-  /* USER CODE END USART3_Init 2 */
-
-}
-
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOE_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, OLED_DC_Pin|OLED_RES_Pin|OLED_SDA_Pin|OLED_SCL_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : LED3_Pin */
-  GPIO_InitStruct.Pin = LED3_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LED3_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : OLED_DC_Pin OLED_RES_Pin OLED_SDA_Pin OLED_SCL_Pin */
-  GPIO_InitStruct.Pin = OLED_DC_Pin|OLED_RES_Pin|OLED_SDA_Pin|OLED_SCL_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-
-}
-
-/* USER CODE BEGIN 4 */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if (htim->Instance == TIM6)
-    {
-    	Encoders_Update();
-    	Odom_Update();
-    	PID_Update();
-    }
-}
-
-/* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
-  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
