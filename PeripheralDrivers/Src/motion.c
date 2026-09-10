@@ -25,10 +25,19 @@ static uint16_t s_settleTarget;   /* servo angle being settled onto        */
 /* ---------------------------------------------------------------------------
  * Arc profiles.
  *
- * ONLY PROFILE 0 IS CALIBRATED. Its brake_deg and radius_mm come from three
- * measured runs each. The other two carry copied guesses and WILL be wrong
- * until they are measured the same way - run a 90, read the err and the R off
- * the turn screen, put them here.
+ * TIGHT and CLEAN have MEASURED radii, by the floor-chord method - mark under
+ * the rear axle, run a 90, mark again, R = chord / 1.414. That is the only
+ * number in the whole system that does not pass through the gyro. SLOW's 306
+ * came from a boost-1.5 measurement at a different speed, so treat it as
+ * approximate until someone runs the chord on it.
+ *
+ * The three sit monotonically in diff_boost - 1.0 gives 318, 1.5 gives 306,
+ * 2.0 gives 291 - which is what the differential assist is supposed to do and
+ * is decent evidence none of them is wildly wrong.
+ *
+ * brake_deg is NOT calibrated and does not need to be: it is only read when
+ * MOTION_ARC_ADAPTIVE_BRAKE is 0, and it is 1. The field is kept so the
+ * fallback still compiles.
  * ------------------------------------------------------------------------- */
 static const ArcProfile_t s_profiles[MOTION_ARC_PROFILE_COUNT] =
 {
@@ -38,8 +47,13 @@ static const ArcProfile_t s_profiles[MOTION_ARC_PROFILE_COUNT] =
     /* 1: no differential assist. Wider, but the rear tyres are not scrubbed
      *    so the path should be a cleaner circle - which matters more than
      *    radius if the planner needs the robot to finish where it predicted.
-     *    MEASURE brake_deg and radius_mm. */
-    { "CLEAN", 575U, 150, 100, 20.0f,   8.0f, 340.0f, 1.0f },
+     *
+     *    radius_mm MEASURED at 318 by floor chord, three runs, all 45 cm.
+     *    Replaces a 340 guess. This one has to be right: the encoder-vs-gyro
+     *    cross-check only runs at boost <= 1.05, so CLEAN is the only profile
+     *    it can use, and radius_mm is its denominator. A guessed radius makes
+     *    the second witness agree with nothing in particular. */
+    { "CLEAN", 575U, 150, 100, 20.0f,   8.0f, 318.0f, 1.0f },
 
     /* 2: slow. Longer to execute, but the coast is much smaller so the stop
      *    is more repeatable, and the inner wheel has plenty of margin above

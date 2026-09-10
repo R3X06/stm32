@@ -485,8 +485,17 @@ static void Display(void)
         {
             long h10 = (long)(IMU_GetHeading() * 10.0f);
             long r10 = (long)(IMU_GetRateDps() * 10.0f);
-            snprintf(line, sizeof(line), "addr %02X id %02X",
-                     IMU_GetAddress(), IMU_GetWhoAmI());
+
+            /* Largest |raw| since the last reset, against the +-32767 rail.
+               This is the clipping detector. A turn that reads short with pk
+               sitting near 32767 is a saturated gyro, not a bad calibration -
+               and that fault is invisible on every other number on this
+               screen, because they all derive from the same clipped samples.
+               Short press zeroes it: zero, run a turn, come back and read.
+               Address and ID have moved to the NOT READY branch, which is
+               where they actually help. */
+            snprintf(line, sizeof(line), "pk%5d/32767",
+                     (int)IMU_GetPeakRaw());
             ShowLine(12, line);
             snprintf(line, sizeof(line), "hd %ld.%ld deg",
                      h10 / 10, (h10 < 0 ? -h10 : h10) % 10);

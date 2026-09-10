@@ -177,10 +177,19 @@
 /* Starting guess for angular deceleration, deg/s^2. Refined from the first
  * turn onwards, so only the first run or two use it directly.
  *
- * Seeded from the measured data: at approach_rpm 100 and R 291 the yaw rate
- * is about 100 deg/s, and the observed coast was about 17 degrees, which
- * gives 100^2 / (2 * 17) = 294. */
-#define MOTION_ARC_DECEL_DPS2       294.0f
+ * SEEDED FROM A CONVERGED RUN, and that matters more than it sounds.
+ *
+ * This was 294, derived from an early estimate of the coast. The learner
+ * actually converges to 636 - the robot stops more than twice as hard as the
+ * old seed assumed - and the cost of the bad seed was visible on the floor:
+ * a cold session ran errors of 9, 7, 3, 2 degrees before settling at 1.
+ *
+ * A.4 is ONE turn on a supervisor's word. A cold robot gives them the 9, not
+ * the 1. Seeding from the converged value is what makes the first turn of a
+ * session behave like the fifth. Both learned values reset at power-off, so
+ * this constant is the only thing standing between a cold start and that
+ * four-run warm-up. */
+#define MOTION_ARC_DECEL_DPS2       636.0f
 
 /* How fast alpha is learned. 0.25 means a quarter of the way to the new
  * measurement each turn - converged in three or four, slow enough that one
@@ -207,7 +216,13 @@
  * learning cannot remove, because alpha only scales the quadratic part. That
  * is exactly the steady -3 degrees seen at 65 deg/s, which is about 45 ms of
  * lag - four or five ticks. */
-#define MOTION_ARC_LAG_S            0.0f
+/* Seeded from the same converged run as MOTION_ARC_DECEL_DPS2 above: the
+ * learner settles at 3 ms. Effectively zero - the bridges bite as soon as the
+ * tick asks them to, and essentially the whole coast is physical rather than
+ * latency. Kept as a seeded constant anyway so a cold start matches a warm
+ * one, and because the term is what absorbs any residual constant error once
+ * alpha has converged. */
+#define MOTION_ARC_LAG_S            0.003f
 #define MOTION_ARC_LAG_GAIN         0.30f
 #define MOTION_ARC_LAG_MAX_S        0.25f
 

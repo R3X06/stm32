@@ -79,6 +79,17 @@
  * Resolution is not a real cost. At +-1000 dps one count is 0.03 dps against
  * a 30 dps signal - a tenth of a percent, far below the noise floor.
  *
+ * CONFIRMED ON THE FLOOR. IMU_GetPeakRaw() during normal TIGHT turns reads
+ * 4000-5000, about 137 dps, against a steady turn rate near 102 - so the
+ * vibration overhead is about 1.4x the mean and the peak sits at 14% of full
+ * scale. The same signal at +-250 dps would sit at 55%, where a spike rails
+ * it. The headroom is doing real work.
+ *
+ * Note what that check can and cannot prove: the peak is read from the
+ * DLPF-filtered output, while saturation happens upstream at the ADC. A high
+ * peak is proof of clipping; a low one is strong evidence against it, not
+ * proof. With 900 dps of headroom above the mean, clipping is implausible.
+ *
  *   FS_SEL  00 = +-250 dps,  131.0 LSB/dps
  *           01 = +-500 dps,   65.5
  *           10 = +-1000 dps,  32.8   <- this one
