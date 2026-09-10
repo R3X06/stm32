@@ -20,15 +20,24 @@ static uint8_t  s_fill;
 static uint16_t s_cmL = SENSOR_NO_READING;
 static uint16_t s_cmR = SENSOR_NO_READING;
 
+/* Median-filtered counts. Written in the control tick, read from the main
+ * loop, hence volatile. This is the number to record when calibrating - a
+ * single DMA sample from a Sharp jumps too much to read off a display. */
+static volatile uint16_t s_medL;
+static volatile uint16_t s_medR;
+
 /* ---------------------------------------------------------------------------
  * CALIBRATING A UNIT
  *
- * The fit in ir.h is the datasheet typical. To do better, tape a target at
- * 10, 15, 20, 30, 40, 50, 60 and 80 cm in turn, note IR_LeftRaw() at each,
- * and fit your own curve. The classic trick is that 1/(d + 0.42) is very
- * nearly linear in output voltage, so plotting raw counts against
- * 1/(d + 0.42) should give a straight line - if it does not, the sensor is
- * seeing something other than your target.
+ * The fits in ir.h were measured this way and are per channel. To redo one -
+ * after remounting or replacing a sensor - park a target at 10, 15, 20, 25,
+ * 30, 40, 50, 60 and 80 cm in turn and note IR_LeftFiltered() at each. Use the
+ * FILTERED value, not IR_LeftRaw(): a single sample jumps far too much to read
+ * off a display. Then fit ln(cm) against ln(volts); the slope is B and the
+ * intercept is ln(A).
+ *
+ * Use the target you will actually be detecting. The arena obstacles are matt
+ * black, and a white card gives a different answer.
  *
  * Do the calibration with the sensor mounted on the robot, not on the bench.
  * These are sensitive to what is behind and beside the target, and a sensor
@@ -45,6 +54,8 @@ void IR_Init(ADC_HandleTypeDef *hadc)
     s_fill = 0U;
     s_cmL  = SENSOR_NO_READING;
     s_cmR  = SENSOR_NO_READING;
+    s_medL = 0U;
+    s_medR = 0U;
 
     for (i = 0U; i < IR_MEDIAN_N; i++)
     {
@@ -104,8 +115,12 @@ static uint16_t median_n(const uint16_t *src, uint8_t n)
     return tmp[n / 2U];
 }
 
-/* Raw counts -> cm, or SENSOR_NO_READING outside the trustworthy span. */
-static uint16_t raw_to_cm(uint16_t raw)
+/* Raw counts -> cm, or SENSOR_NO_READING outside the trustworthy span.
+ *
+ * The fit constants are arguments, not constants read from ir.h, because the
+ * two sensors differ by about 20% in sensitivity and each needs its own pair.
+ * See the note above IR_L_FIT_A. */
+static uint16_t raw_to_cm(uint16_t raw, float fit_a, float fit_b)
 {
     float volts;
     float cm;
@@ -118,11 +133,12 @@ static uint16_t raw_to_cm(uint16_t raw)
      * nothing except "further than I can see". */
     if (volts < 0.30f) { return SENSOR_NO_READING; }
 
-    cm = IR_FIT_A * powf(volts, IR_FIT_B);
+    cm = fit_a * powf(volts, fit_b);
 
-    /* The near-field ambiguity. Anything the fit puts under IR_MIN_VALID_CM
-     * could equally be an object much closer than that, on the far side of
-     * the response peak. Refuse to guess. */
+    /* The saturated near field. Below about 10 cm the sensor output is close
+     * to its ceiling and the fit maps 5 cm and 8 cm to nearly the same answer,
+     * so anything landing under IR_MIN_VALID_CM could be a good deal closer
+     * than it claims. Refuse to guess. */
     if (cm < (float)IR_MIN_VALID_CM) { return SENSOR_NO_READING; }
     if (cm > (float)IR_MAX_VALID_CM) { return SENSOR_NO_READING; }
 
@@ -146,12 +162,17 @@ void IR_Update(void)
      * decision on the final, filtered number. */
     if (s_fill >= IR_MEDIAN_N)
     {
-        s_cmL = raw_to_cm(median_n(s_bufL, IR_MEDIAN_N));
-        s_cmR = raw_to_cm(median_n(s_bufR, IR_MEDIAN_N));
+        s_medL = median_n(s_bufL, IR_MEDIAN_N);
+        s_medR = median_n(s_bufR, IR_MEDIAN_N);
+
+        s_cmL = raw_to_cm(s_medL, IR_L_FIT_A, IR_L_FIT_B);
+        s_cmR = raw_to_cm(s_medR, IR_R_FIT_A, IR_R_FIT_B);
     }
 }
 
-uint16_t IR_LeftCm(void)   { return s_cmL; }
-uint16_t IR_RightCm(void)  { return s_cmR; }
-uint16_t IR_LeftRaw(void)  { return s_dma[0]; }
-uint16_t IR_RightRaw(void) { return s_dma[1]; }
+uint16_t IR_LeftCm(void)        { return s_cmL; }
+uint16_t IR_RightCm(void)       { return s_cmR; }
+uint16_t IR_LeftRaw(void)       { return s_dma[0]; }
+uint16_t IR_RightRaw(void)      { return s_dma[1]; }
+uint16_t IR_LeftFiltered(void)  { return s_medL; }
+uint16_t IR_RightFiltered(void) { return s_medR; }

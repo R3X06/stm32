@@ -456,10 +456,14 @@ static void Display(void)
         break;
 
     case MODE_IRCAL:
-        ShowLine(0, "8 IRCAL raw");
-        snprintf(line, sizeof(line), "L %4u cnt", IR_LeftRaw());
+        /* Median, not the live sample. The screen exists to have a number
+           copied off it at a known distance, and a raw Sharp reading moves
+           too much to read. Title says so - a screen labelled "raw" showing
+           a filtered value would be its own trap. */
+        ShowLine(0, "8 IRCAL median");
+        snprintf(line, sizeof(line), "L %4u cnt", IR_LeftFiltered());
         ShowLine(12, line);
-        snprintf(line, sizeof(line), "R %4u cnt", IR_RightRaw());
+        snprintf(line, sizeof(line), "R %4u cnt", IR_RightFiltered());
         ShowLine(24, line);
         snprintf(line, sizeof(line), "US %5u us", Ultrasonic_GetLastUs());
         ShowLine(36, line);
@@ -709,9 +713,17 @@ static void PrintSensors(void)
              (long)(Encoder_B_GetCount() / 10));
     RpiLink_Send(line);
 
+    /* Median first - that is the calibration number. Raw is alongside it as a
+       liveness check: frozen raw means the ADC or the wiring, not the fit. */
     snprintf(line, sizeof(line),
-             "IR raw L %4u R %4u   US echo %5u us  n=%lu\r\n",
-             IR_LeftRaw(), IR_RightRaw(), Ultrasonic_GetLastUs(),
+             "IR med L %4u R %4u   (raw %4u %4u)\r\n",
+             IR_LeftFiltered(), IR_RightFiltered(),
+             IR_LeftRaw(), IR_RightRaw());
+    RpiLink_Send(line);
+
+    snprintf(line, sizeof(line),
+             "US echo %5u us  n=%lu\r\n",
+             Ultrasonic_GetLastUs(),
              (unsigned long)Ultrasonic_GetEchoCount());
     RpiLink_Send(line);
 
@@ -1328,6 +1340,15 @@ static void MX_GPIO_Init(void)
     g.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOB, &g);
     HAL_GPIO_WritePin(GPIOB, US_Trig_Pin, GPIO_PIN_RESET);
+
+    /* Servo signal PB15, held low until MX_TIM12_Init() hands it to the timer.
+       A floating input on the servo makes it twitch and draw stall current,
+       which the board's care notes list as a way to damage the STM32. This
+       covers the window from reset to TIM12; the vendor's suggested 2.2k
+       pull-down covers the window before the MCU is running at all. */
+    g.Pin = GPIO_PIN_15;
+    HAL_GPIO_Init(GPIOB, &g);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
 }
 
 void Error_Handler(void)

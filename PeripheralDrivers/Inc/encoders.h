@@ -54,6 +54,18 @@
  * Easiest measurement: mark the wheel, call Encoders_Reset(), turn the wheel
  * exactly 10 revolutions by hand, read Encoder_A_GetCount(), divide by 10.
  * That result is COUNTS_PER_REV directly.
+ *
+ * *** DO NOT CHANGE 13 TO 11 ON THE STRENGTH OF THE KIT'S DATASHEET PDF. ***
+ *
+ * DCMotor_Encoder_ServoMotor_DataSheets_v2.pdf describes a JGB37-520 with an
+ * 11 PPR encoder. That is not this motor. The issued part is an MG513P3012V
+ * (see the component list), and 13 PPR is what the ten-revolution test gave.
+ * The measured free speed agrees: 378 RPM at 1560 counts/rev is sane for a
+ * 12 V 1:30 gearmotor on a 12.6 V pack, where 11 PPR would imply 447.
+ *
+ * 11 would give 1320 counts/rev and the robot would stop 15% short of every
+ * commanded distance - outside A.3's +/-6%. Last year's firmware shipped with
+ * exactly that value, taken from exactly that PDF.
  * ------------------------------------------------------------------------- */
 #define ENCODER_PPR             13U
 #define ENCODER_GEAR_RATIO      30U
