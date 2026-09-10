@@ -23,13 +23,25 @@
   *               result on screen: target, odometry, error %, and B/A
   *               encoder agreement for that run.
   *    2 SETDIST  SHORT steps the target 800..1200 mm in 100 mm steps.
-  *    3 SENSE    Live calibrated distances from both IRs and the ultrasonic,
+  *    3 TURN     A.4 run. SHORT turns the selected angle and holds the
+  *               result: commanded, measured, error, radius, cross-check.
+  *    4 SETANGLE SHORT steps angle 90/180/270/360 and the direction.
+  *    5 PROFILE  SHORT cycles the arc profiles. Shows the learned decel and
+  *               brake lag, which is where converged seed values come from.
+  *    6 SERVO    End-stop sweep. Auto-centres 2 s after the last press.
+  *    7 SENSE    Live calibrated distances from both IRs and the ultrasonic,
   *               plus the echo counter. SHORT streams a sample to USART3.
-  *    4 IRCAL    Raw filtered ADC counts, for filling in the IR lookup table
-  *               in ir.c. SHORT streams a sample to USART3.
+  *    8 IRCAL    Median-filtered ADC counts, for fitting the IR curve in
+  *               ir.h. SHORT streams a sample to USART3.
+  *    9 IMU      Gyro diagnostics: heading, rate, poll rate, stalls, and the
+  *               peak raw value against the full-scale rail.
   *
   *  CONTROL TICK - TIM6, 100 Hz, priority 6. Order is not negotiable:
-  *      Encoders_Update() -> Motion_Tick() -> Odom_Update() -> PID_Update()
+  *      Encoders_Update() -> IR_Update() -> Ultrasonic_Tick() -> IMU_Tick()
+  *                        -> Motion_Tick() -> Odom_Update() -> PID_Update()
+  *
+  *  Sensors first, then control. IMU_Tick() must precede Odom_Update() or the
+  *  heading loop acts on a value one tick stale.
   *
   *  The sensors are cheap by construction, so they ride in the tick without
   *  disturbing it: IR_Update() only reads a buffer the DMA has already
@@ -349,16 +361,21 @@ static void Display(void)
         }
         else if (g_turnValid)
         {
-            /* Radius the robot ACTUALLY drove, derived from the arc length
-               the encoders measured and the angle the gyro measured:
+            /* Radius implied by the arc length the encoders measured and the
+               angle the gyro measured:
 
                    R = arc_length / angle_in_radians
 
-               Both numbers are already known, so this costs nothing and it
-               is the number to watch while tuning MOTION_ARC_STEER_US - it
-               says how much floor a turn eats. Feed it back into
-               MOTION_ARC_RADIUS_MM so the inner/outer wheel split matches
-               reality and the tyres stop scrubbing. */
+               Both numbers are already known, so this costs nothing. TREAT IT
+               AS INDICATIVE ONLY. On a boosted profile the rear tyres are
+               deliberately scrubbed, so the wheels turn further than the
+               ground travelled and this reads high by an unknown amount - it
+               is honest only at diff_boost 1.0.
+
+               The authoritative radius comes off the floor: mark under the
+               rear axle, run a 90, mark again, R = chord / 1.414. That is the
+               only measurement in the system that owes the gyro nothing, and
+               it is what the per-profile radius_mm values were set from. */
             long turned = (long)g_turnGot;
             long mag    = (turned < 0) ? -turned : turned;
             long radius = (mag > 0)

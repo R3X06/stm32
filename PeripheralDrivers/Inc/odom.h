@@ -34,13 +34,10 @@
  * calipers at 65-66 mm, and four road tests agreed on 65.87 to 66.06 with
  * the wheels averaged.
  *
- * 65.6 rather than 65.9 because the per-wheel counts below changed what the
- * average means. Before, wheel B under-reported by 0.8%, so the averaged
- * odometry read 0.9961 of wheel A and 65.9 was an averaged figure absorbing
- * the mismatch. With B rescaled the average equals wheel A, so the diameter
- * has to come down by the same 0.39% or the robot stops 4 mm short.
- *
- * If a run lands short after this change, put it back to 65.9. */
+ * There was briefly a case for 65.6, to compensate a per-wheel count change
+ * on encoder B. That change was reverted - both wheels are back at 1560, see
+ * below - so the compensation went with it. 65.9 is the measured figure and
+ * is what A.3 was proven at, 0.0 to 0.3% error at 1000 and 1200 mm. */
 #define WHEEL_DIAMETER_MM   65.9f
 #define WHEEL_BASE_MM       127.0f
 
@@ -83,7 +80,7 @@
 /* Kept for anything still referencing the single-wheel name. */
 #define ODOM_COUNTS_PER_REV ODOM_COUNTS_PER_REV_A
 
-/* 63.5 * pi / 1560 -- about 0.128 mm of travel per count. */
+/* 65.9 * pi / 1560 -- about 0.133 mm of travel per count. */
 #define MM_PER_COUNT_A ((WHEEL_DIAMETER_MM * 3.14159265f) / ODOM_COUNTS_PER_REV_A)
 #define MM_PER_COUNT_B ((WHEEL_DIAMETER_MM * 3.14159265f) / ODOM_COUNTS_PER_REV_B)
 #define MM_PER_COUNT   MM_PER_COUNT_A

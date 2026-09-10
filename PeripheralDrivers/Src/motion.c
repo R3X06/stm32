@@ -325,8 +325,9 @@ void Motion_DriveArc(int16_t degrees, uint8_t forward, uint8_t right)
 
     /* Keep the commanded angle so the result screen can report error against
      * what was ASKED for. Reporting against s_arcTargetDeg instead compares
-     * the outcome to the brake-compensated internal target, so a perfectly
-     * executed turn shows an error equal to MOTION_ARC_BRAKE_DEG forever. */
+     * the outcome to the internal target, and on the non-adaptive path that
+     * target is short by the profile's brake_deg - so a perfectly executed
+     * turn would show that as a permanent error. */
     s_arcCommandDeg = degrees;
     if (right)    { s_arcCommandDeg = (int16_t)(-s_arcCommandDeg); }
     if (!forward) { s_arcCommandDeg = (int16_t)(-s_arcCommandDeg); }

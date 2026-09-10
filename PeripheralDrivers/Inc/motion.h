@@ -65,10 +65,10 @@
  * all of that irrelevant: the robot turns until the gyro says it has turned
  * far enough, whatever path it took to get there.
  *
- * MOTION_ARC_RADIUS_MM SURVIVES BUT NO LONGER SETS THE ANGLE. It is used
- * only by Odom_DriveArc() to split the inner and outer wheel speeds so the
- * tyres do not scrub. A rough value there costs a little scrub, not accuracy,
- * so it does not need calibrating for A.4 to pass.
+ * The turn radius no longer sets the angle either. Each profile carries its
+ * own measured radius_mm, used only by Odom_DriveArc() to split the inner and
+ * outer wheel speeds so the tyres do not scrub, and as the denominator of the
+ * encoder cross-check. A rough value costs a little scrub, not accuracy.
  *
  * MOTION_ARC_STEER_US is the deflection from centre used for every arc. Keep
  * it inside SERVO_MIN_US..SERVO_MAX_US or Servo_SetMicroseconds() clamps it
@@ -86,8 +86,6 @@
  * inflated by the same factor. Nothing measured before that fix says anything
  * reliable about what the steering is doing. */
 #define MOTION_ARC_STEER_US     575U
-
-#define MOTION_ARC_RADIUS_MM    326.0f
 
 /* Slow down for the last part of the turn, degrees remaining. Same reasoning
  * as MOTION_APPROACH_MM on a straight run: a slow approach makes the stopping
@@ -123,13 +121,11 @@
  * is a long way. This catches it in about a second instead. */
 #define MOTION_ARC_WRONGWAY_DEG 20.0f
 
-#define MOTION_ARC_RPM          150
-
 /* Approach speed for arcs, SEPARATE from MOTION_APPROACH_RPM.
  *
  * A straight-line approach can be slow because both wheels run at the same
  * speed. An arc cannot: the inner wheel is driven at a fraction of the centre
- * speed, and with ODOM_ARC_DIFF_BOOST at 2.0 that fraction is about 0.56.
+ * speed, and with the profile's diff_boost at 2.0 that fraction is about 0.56.
  *
  * At the straight-line figure of 40 rpm the inner wheel is commanded at 22 -
  * below PID_MIN_RPM, so the PID gives up and outputs zero and the wheel
@@ -282,15 +278,6 @@ uint8_t Motion_XCheckFailed(void);
 /* Current learned value, for the display. */
 float Motion_GetArcDecel(void);
 float Motion_GetArcLag(void);
-
-#define MOTION_ARC_APPROACH_RPM 100
-
-#define MOTION_ARC_APPROACH_DEG 20.0f
-
-/* Angular coast after braking, degrees. MEASURE IT, same method as
- * MOTION_BRAKE_MM: leave it at 0, command 180, read what the robot actually
- * turned, and put the excess here. Starting guess only. */
-#define MOTION_ARC_BRAKE_DEG    0.0f
 
 /* Settling time for the steering before the wheels are allowed to turn, in
  * 10 ms ticks.

@@ -60,7 +60,17 @@ extern "C" {
 
 /* Per-primitive watchdog. If a primitive has not completed within this many
  * milliseconds the motion layer aborts it, brakes, and the line still replies
- * so the RPi is never left waiting forever on a stalled wheel. */
+ * so the RPi is never left waiting forever on a stalled wheel.
+ *
+ * *** NOT CURRENTLY HONOURED - THE FIRMWARE USES 15 s. ***
+ *
+ * motion.c enforces MOTION_TIMEOUT_TICKS, which is 1500 ticks at 10 ms. This
+ * constant is left here rather than deleted because the gap is a protocol
+ * question, not dead code: if the RPi gives up at 8 s while the STM is still
+ * working through a 15 s watchdog, the two desynchronise and the next reply
+ * lands against the wrong command. Reconcile the two numbers with the RPi
+ * owner before the first wire test, and make whichever survives the one both
+ * sides read. */
 #define CMD_PRIMITIVE_TIMEOUT_MS   8000u
 
 
