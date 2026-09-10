@@ -124,6 +124,14 @@ void Servo_SetMicroseconds(uint16_t us)
     __HAL_TIM_SET_COMPARE(&htim12, TIM_CHANNEL_2, us);
 }
 
+void Servo_SetRawUs(uint16_t us)
+{
+    if (us < SERVO_ABS_MIN_US)      us = SERVO_ABS_MIN_US;
+    else if (us > SERVO_ABS_MAX_US) us = SERVO_ABS_MAX_US;
+
+    __HAL_TIM_SET_COMPARE(&htim12, TIM_CHANNEL_2, us);
+}
+
 void Servo_SetAngle(uint8_t degrees)
 {
     uint32_t us;

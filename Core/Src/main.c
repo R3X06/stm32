@@ -75,8 +75,9 @@
 #define DIST_MAX_MM          1200
 #define DIST_STEP_MM         100
 
-typedef enum { MODE_DRIVE = 0, MODE_SETDIST, MODE_SENSE, MODE_IRCAL,
-               MODE_IMU, MODE_COUNT } uimode_t;
+typedef enum { MODE_DRIVE = 0, MODE_SETDIST, MODE_TURN, MODE_SETANGLE,
+               MODE_PROFILE, MODE_SERVO, MODE_SENSE, MODE_IRCAL, MODE_IMU,
+               MODE_COUNT } uimode_t;
 
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef  htim2;    /* encoder A  PA15 / PB3      */
@@ -97,6 +98,39 @@ static volatile uimode_t g_mode = MODE_DRIVE;
 /* Commanded distance for the next run. Changed in MODE_SETDIST. */
 static volatile int32_t  g_targetMm = DIST_TARGET_MM;
 
+/* Turn selection for A.4, changed in MODE_SETANGLE. The checklist says the
+   supervisor names an angle between 90 and 360, so the whole range has to be
+   reachable from the button. Both directions, because "specified" does not
+   promise which way. */
+static const int16_t  g_angleList[] = { 90, 180, 270, 360 };
+#define ANGLE_COUNT  (sizeof(g_angleList) / sizeof(g_angleList[0]))
+static volatile uint8_t g_angleIdx   = 0;
+static volatile uint8_t g_turnRight  = 1;   /* 1 = right, 0 = left */
+static volatile uint8_t g_turnFwd    = 1;   /* 1 = forward, 0 = reverse */
+
+/* Latched turn result, same pattern as the distance run. */
+static volatile uint8_t g_turnValid  = 0;
+static volatile int32_t g_turnTarget = 0;
+static volatile int32_t g_turnGot    = 0;
+
+/* Servo end-stop sweep. Steps across SERVO_ABS_MIN_US..SERVO_ABS_MAX_US so
+   the real mechanical limits can be found - the ones in motors.h are still
+   the provisional Phase 2 guesses, and they are what caps the turn radius. */
+#define SERVO_SWEEP_STEP_US  25U
+
+/* Auto-centre the sweep this long after the last button press.
+ *
+ * The whole point of the sweep is to push the steering until it stops moving,
+ * which means it ends every session parked against a mechanical stop with the
+ * servo stalled. A stalled servo draws its full stall current continuously and
+ * gets hot within a minute. Long-pressing out of the mode recentres it, but
+ * that relies on remembering; this does not. */
+#define SERVO_SWEEP_HOLD_MS  2000U
+
+static volatile uint16_t g_sweepUs   = SERVO_CENTER_US;
+static volatile uint32_t g_sweepAtMs = 0;
+static volatile uint8_t  g_sweepHeld = 0;
+
 /* Latched at the end of a DRIVE run so the main loop can print it, and so
    the display can hold the result instead of reverting to a live readout
    the moment the state machine goes back to IDLE. */
@@ -111,6 +145,12 @@ static volatile int32_t  g_repCntB = 0;
    normal operation, so subtracting these is the only way to get counts for
    THIS run. Without them B/A becomes a lifetime average that quietly stops
    showing run-to-run scatter - which is the whole thing we are looking for. */
+/* Which kind of move produced the latched result. Without it a finished TURN
+   sets g_repValid and the DRIVE screen shows a distance error and a B/A ratio
+   belonging to something else entirely - numbers that look authoritative and
+   are meaningless. */
+static volatile uint8_t  g_lastWasTurn = 0;
+
 static volatile int32_t  g_runStartA = 0;
 static volatile int32_t  g_runStartB = 0;
 static volatile uint8_t  g_repTimeout = 0;
@@ -189,6 +229,17 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         Ultrasonic_Tick();
         IMU_Tick();
 
+        /* Zero-rate update. The wheels not moving and no primitive running
+           means the true yaw rate is zero, so anything the gyro reads right
+           now is bias - a free measurement, taken every time the robot sits
+           still between runs. Without it the heading creeps while parked and
+           the drift is baked into the next run. */
+        if (!Motion_IsBusy() &&
+            (Encoder_A_GetDelta() == 0) && (Encoder_B_GetDelta() == 0))
+        {
+            IMU_TrackBias();
+        }
+
         Motion_Tick();
         Odom_Update();
         PID_Update();
@@ -205,9 +256,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                 g_repMm       = (int32_t)Odom_GetDistance();
                 g_repCntA     = Encoder_A_GetCount() - g_runStartA;
                 g_repCntB     = Encoder_B_GetCount() - g_runStartB;
+                g_turnTarget  = Motion_GetTurnTargetDeg();
+                g_turnGot     = Motion_GetTurnedDeg();
                 g_repTimeout  = (st == MOTION_TIMEOUT) ? 1U : 0U;
                 g_reportReady = 1U;
-                g_repValid    = 1U;
+                g_repValid    = g_lastWasTurn ? 0U : 1U;
             }
         }
     }
@@ -259,8 +312,141 @@ static void Display(void)
 
     switch (g_mode)
     {
+    case MODE_SETANGLE:
+        ShowLine(0,  "4 SET ANGLE");
+        snprintf(line, sizeof(line), "%s%d  %s",
+                 g_turnRight ? "R" : "L",
+                 (int)g_angleList[g_angleIdx],
+                 g_turnFwd ? "fwd" : "rev");
+        ShowLine(12, line);
+        ShowLine(24, "short = next");
+        ShowLine(36, "90/180/270/360");
+        ShowLine(48, "R fwd L fwd R rev");
+        break;
+
+    case MODE_TURN:
+        snprintf(line, sizeof(line), "3 TURN %s%s",
+                 Motion_IsBusy() ? st[(int)Motion_GetState()] : "",
+                 IMU_IsReady() ? "" : " !NOGYRO");
+        ShowLine(0, line);
+        snprintf(line, sizeof(line), "%s%d %s",
+                 g_turnRight ? "R" : "L",
+                 (int)g_angleList[g_angleIdx],
+                 g_turnFwd ? "fwd" : "rev");
+        ShowLine(12, line);
+
+        if (Motion_IsBusy())
+        {
+            snprintf(line, sizeof(line), "now %ld deg",
+                     (long)Motion_GetTurnedDeg());
+            ShowLine(24, line);
+            snprintf(line, sizeof(line), "A %ld B %ld",
+                     (long)Encoder_A_GetRPM(), (long)Encoder_B_GetRPM());
+            ShowLine(36, line);
+            snprintf(line, sizeof(line), "sv %u us",
+                     (unsigned)Odom_GetServoUs());
+            ShowLine(48, line);
+        }
+        else if (g_turnValid)
+        {
+            /* Radius the robot ACTUALLY drove, derived from the arc length
+               the encoders measured and the angle the gyro measured:
+
+                   R = arc_length / angle_in_radians
+
+               Both numbers are already known, so this costs nothing and it
+               is the number to watch while tuning MOTION_ARC_STEER_US - it
+               says how much floor a turn eats. Feed it back into
+               MOTION_ARC_RADIUS_MM so the inner/outer wheel split matches
+               reality and the tyres stop scrubbing. */
+            long turned = (long)g_turnGot;
+            long mag    = (turned < 0) ? -turned : turned;
+            long radius = (mag > 0)
+                        ? (long)(Motion_GetTravelled() * 57.2958f / (float)mag)
+                        : 0L;
+
+            snprintf(line, sizeof(line), "got %ld deg  %s", (long)g_turnGot,
+                     Motion_GetArcProfileInfo(Motion_GetArcProfile())->name);
+            ShowLine(24, line);
+            snprintf(line, sizeof(line), "err %ld deg",
+                     (long)(g_turnGot - g_turnTarget));
+            ShowLine(36, line);
+            /* Second witness on the bottom line. XOK means the encoders
+               agree with the gyro; XBAD means they do not and something needs
+               a tape measure. X-- means the check did not run, which is
+               normal on a boosted profile - scrubbed tyres make the encoder
+               arc meaningless. */
+            if (Motion_GetXCheckDeg() > 0.0f)
+            {
+                snprintf(line, sizeof(line), "R%ld %s %+d%%", radius,
+                         Motion_XCheckFailed() ? "XBAD" : "XOK",
+                         (int)Motion_GetXCheckErrPct());
+            }
+            else
+            {
+                snprintf(line, sizeof(line), "arc%ld R%ld X--",
+                         (long)Motion_GetTravelled(), radius);
+            }
+            ShowLine(48, line);
+        }
+        else
+        {
+            ShowLine(24, "short = GO");
+            ShowLine(36, "");
+            ShowLine(48, "");
+        }
+        break;
+
+    case MODE_PROFILE:
+        {
+            const ArcProfile_t *pr = Motion_GetArcProfileInfo(Motion_GetArcProfile());
+            uint16_t steer = Motion_GetArcSteerUs();
+
+            snprintf(line, sizeof(line), "5 PROFILE %s", pr->name);
+            ShowLine(0, line);
+            snprintf(line, sizeof(line), "steer %u us%s", (unsigned)steer,
+                     (steer < pr->steer_us) ? " CLMP" : "");
+            ShowLine(12, line);
+            snprintf(line, sizeof(line), "rpm %d/%d", pr->rpm, pr->approach_rpm);
+            ShowLine(24, line);
+            snprintf(line, sizeof(line), "R%d a%d lag%dms",
+                     (int)pr->radius_mm, (int)Motion_GetArcDecel(),
+                     (int)(Motion_GetArcLag() * 1000.0f));
+            ShowLine(36, line);
+            ShowLine(48, "short = next");
+        }
+        break;
+
+    case MODE_SERVO:
+        ShowLine(0,  "6 SERVO SWEEP");
+        snprintf(line, sizeof(line), "us  %u", (unsigned)g_sweepUs);
+        ShowLine(12, line);
+        snprintf(line, sizeof(line), "off %+d",
+                 (int)g_sweepUs - (int)SERVO_CENTER_US);
+        ShowLine(24, line);
+        snprintf(line, sizeof(line), "lim %u-%u",
+                 (unsigned)SERVO_MIN_US, (unsigned)SERVO_MAX_US);
+        ShowLine(36, line);
+        {
+            /* Flag anything outside the known-good 1300-1700 span. Past the
+               linkage stop the servo is stalling at full torque, and on a
+               plastic-geared servo that strips teeth rather than just getting
+               hot. The wheels are the real indicator - if they have stopped
+               moving, stop stepping. */
+            int off = (int)g_sweepUs - (int)SERVO_CENTER_US;
+            if ((off > 200) || (off < -200))
+            {
+                ShowLine(48, g_sweepHeld ? "** PAST SPAN **" : "centred");
+            }
+            else
+            {
+                ShowLine(48, g_sweepHeld ? "HELD short=+25" : "centred short=+25");
+            }
+        }
+        break;
+
     case MODE_SENSE:
-        ShowLine(0, "3 SENSE");
+        ShowLine(0, "7 SENSE");
         FmtCm(line, sizeof(line), "IRL", IR_LeftCm());       ShowLine(12, line);
         FmtCm(line, sizeof(line), "IRR", IR_RightCm());      ShowLine(24, line);
         FmtCm(line, sizeof(line), "US ", Ultrasonic_GetCm()); ShowLine(36, line);
@@ -270,7 +456,7 @@ static void Display(void)
         break;
 
     case MODE_IRCAL:
-        ShowLine(0, "4 IRCAL raw");
+        ShowLine(0, "8 IRCAL raw");
         snprintf(line, sizeof(line), "L %4u cnt", IR_LeftRaw());
         ShowLine(12, line);
         snprintf(line, sizeof(line), "R %4u cnt", IR_RightRaw());
@@ -281,7 +467,7 @@ static void Display(void)
         break;
 
     case MODE_IMU:
-        ShowLine(0, "5 IMU gyro");
+        ShowLine(0, "9 IMU gyro");
         if (!IMU_IsReady())
         {
             ShowLine(12, "NOT READY");
@@ -304,8 +490,10 @@ static void Display(void)
             snprintf(line, sizeof(line), "rate %ld.%ld dps",
                      r10 / 10, (r10 < 0 ? -r10 : r10) % 10);
             ShowLine(36, line);
-            snprintf(line, sizeof(line), "bias %d er %lu",
-                     IMU_GetBias(), (unsigned long)IMU_GetErrorCount());
+            snprintf(line, sizeof(line), "hz%lu er%lu st%lu",
+                     (unsigned long)IMU_GetPollRate(),
+                     (unsigned long)IMU_GetErrorCount(),
+                     (unsigned long)IMU_GetStallCount());
             ShowLine(48, line);
         }
         break;
@@ -333,8 +521,13 @@ static void Display(void)
         if (Motion_IsBusy())
         {
             /* Live view while moving. */
-            snprintf(line, sizeof(line), "1 DRIVE %s",
-                     st[(int)Motion_GetState()]);
+            /* The '!' means the gyro is not running and heading has fallen
+               back to the encoder difference. Accuracy drops, and the fact
+               that it is silent is exactly how a 90 degree turn once ran to
+               369 - so say so on the screen the run is being watched on. */
+            snprintf(line, sizeof(line), "1 DRIVE %s%s",
+                     st[(int)Motion_GetState()],
+                     IMU_IsReady() ? "" : " !");
             ShowLine(0, line);
             snprintf(line, sizeof(line), "tgt %4ld mm", (long)g_targetMm);
             ShowLine(12, line);
@@ -344,8 +537,9 @@ static void Display(void)
             snprintf(line, sizeof(line), "A %ld B %ld",
                      (long)Encoder_A_GetRPM(), (long)Encoder_B_GetRPM());
             ShowLine(36, line);
-            snprintf(line, sizeof(line), "sv %u  hd %ld.%ld",
-                     (unsigned)Odom_GetServoUs(), whole, frac);
+            snprintf(line, sizeof(line), "sv%u y%+d hd%ld.%ld",
+                     (unsigned)Odom_GetServoUs(),
+                     (int)Odom_GetCrossTrack(), whole, frac);
             ShowLine(48, line);
         }
         else if (g_repValid)
@@ -443,6 +637,11 @@ static void PrintDriveReport(void)
         RpiLink_Send(line);
     }
 
+    snprintf(line, sizeof(line),
+             "steer trim %+d us  -> add to SERVO_CENTER_US when settled\r\n",
+             (int)Odom_GetHeadingTrim());
+    RpiLink_Send(line);
+
     RpiLink_Send("Now TAPE MEASURE the real distance.\r\n");
     RpiLink_Send("Two separate faults, two separate numbers:\r\n");
     RpiLink_Send("  odometry vs TAPE  = wheel diameter\r\n");
@@ -453,6 +652,51 @@ static void PrintDriveReport(void)
     RpiLink_Send("odometry keeps counting through the coast, so\r\n");
     RpiLink_Send("the tape/odometry ratio is coast-immune.\r\n");
     RpiLink_Send("Five runs, average, then re-check.\r\n\r\n");
+}
+
+static void PrintTurnReport(void)
+{
+    char line[96];
+
+    {
+        const ArcProfile_t *pr = Motion_GetArcProfileInfo(Motion_GetArcProfile());
+        snprintf(line, sizeof(line), "\r\n[profile %s]  ", pr->name);
+        RpiLink_Send(line);
+    }
+    RpiLink_Send("--- A.4 TURN ");
+    RpiLink_Send(g_repTimeout ? "TIMEOUT ---\r\n" : "DONE ---\r\n");
+
+    snprintf(line, sizeof(line), "commanded  %ld deg\r\n", (long)g_turnTarget);
+    RpiLink_Send(line);
+    snprintf(line, sizeof(line), "gyro       %ld deg  (err %ld)\r\n",
+             (long)g_turnGot, (long)(g_turnGot - g_turnTarget));
+    RpiLink_Send(line);
+    {
+        long mag = (g_turnGot < 0) ? -g_turnGot : g_turnGot;
+        snprintf(line, sizeof(line), "arc length %ld mm   radius %ld mm\r\n",
+                 (long)Motion_GetTravelled(),
+                 (mag > 0) ? (long)(Motion_GetTravelled() * 57.2958f / (float)mag) : 0L);
+        RpiLink_Send(line);
+    }
+
+    snprintf(line, sizeof(line), "learned decel %d deg/s2, lag %d ms\r\n",
+             (int)Motion_GetArcDecel(), (int)(Motion_GetArcLag() * 1000.0f));
+    RpiLink_Send(line);
+
+    if (Motion_GetXCheckDeg() > 0.0f)
+    {
+        snprintf(line, sizeof(line),
+                 "cross-check: encoders say %d deg, gyro says %d, %+d%% %s\r\n",
+                 (int)Motion_GetXCheckDeg(), (int)Motion_GetTurnedDeg(),
+                 (int)Motion_GetXCheckErrPct(),
+                 Motion_XCheckFailed() ? "*** DISAGREE ***" : "agree");
+        RpiLink_Send(line);
+    }
+    else
+    {
+        RpiLink_Send("cross-check skipped - needs a profile with boost 1.0\r\n");
+    }
+    RpiLink_Send("Braking is adaptive - no constant to set.\r\n\r\n");
 }
 
 static void PrintSensors(void)
@@ -543,7 +787,8 @@ int main(void)
 
     RpiLink_Send("\r\n=== C30D FUNCTIONAL TEST BUILD ===\r\n");
     RpiLink_Send("LONG press = mode, SHORT = action\r\n");
-    RpiLink_Send("1 DRIVE 2 SETDIST 3 SENSE 4 IRCAL 5 IMU\r\n\r\n");
+    RpiLink_Send("1 DRIVE 2 SETDIST 3 TURN 4 SETANGLE\r\n");
+    RpiLink_Send("5 PROFILE 6 SERVO 7 SENSE 8 IRCAL 9 IMU\r\n\r\n");
 
     /* Tick LAST - nothing fires against an uninitialised module. */
     MX_TIM6_Init();
@@ -561,6 +806,11 @@ int main(void)
             g_reportReady = 0U;
             Motion_ClearState();
             if (g_mode == MODE_DRIVE) { PrintDriveReport(); }
+            if ((g_mode == MODE_TURN) && g_lastWasTurn)
+            {
+                g_turnValid = 1U;
+                PrintTurnReport();
+            }
         }
 
         if (g_evtLong)
@@ -572,6 +822,16 @@ int main(void)
             Motion_Stop();
             Motion_ClearState();
             Motors_Coast();
+
+            /* Leaving the sweep, put the steering back to centre. Walking
+               away with the servo held against a mechanical stop stalls it
+               and it will get hot. */
+            if (g_mode == MODE_SERVO)
+            {
+                g_sweepUs   = SERVO_CENTER_US;
+                g_sweepHeld = 0U;
+                Servo_SetRawUs(SERVO_CENTER_US);
+            }
 
             g_mode = (uimode_t)(((int)g_mode + 1) % (int)MODE_COUNT);
         }
@@ -586,10 +846,61 @@ int main(void)
                 Motors_Coast();
                 RpiLink_Send("STOP\r\n");
             }
+            else if (g_mode == MODE_SETANGLE)
+            {
+                /* One button, three things to choose. Step the angle, and
+                   roll over into the next direction when it wraps. */
+                g_angleIdx++;
+                if (g_angleIdx >= ANGLE_COUNT)
+                {
+                    g_angleIdx = 0U;
+                    if (g_turnRight) { g_turnRight = 0U; }
+                    else             { g_turnRight = 1U; g_turnFwd = !g_turnFwd; }
+                }
+            }
+            else if (g_mode == MODE_TURN)
+            {
+                g_turnValid   = 0U;
+                g_lastWasTurn = 1U;
+                g_runStartA   = Encoder_A_GetCount();
+                g_runStartB   = Encoder_B_GetCount();
+                RpiLink_Send("\r\nA.4 turn starting\r\n");
+                Motion_DriveArc(g_angleList[g_angleIdx], g_turnFwd, g_turnRight);
+            }
+            else if (g_mode == MODE_PROFILE)
+            {
+                char msg[64];
+                uint8_t n = (uint8_t)((Motion_GetArcProfile() + 1U)
+                                      % MOTION_ARC_PROFILE_COUNT);
+                Motion_SetArcProfile(n);
+                snprintf(msg, sizeof(msg), "arc profile -> %s\r\n",
+                         Motion_GetArcProfileInfo(n)->name);
+                RpiLink_Send(msg);
+            }
+            else if (g_mode == MODE_SERVO)
+            {
+                char msg[48];
+
+                g_sweepUs += SERVO_SWEEP_STEP_US;
+                if (g_sweepUs > SERVO_ABS_MAX_US)
+                {
+                    g_sweepUs = SERVO_ABS_MIN_US;
+                }
+
+                Servo_SetRawUs(g_sweepUs);
+                g_sweepAtMs = HAL_GetTick();
+                g_sweepHeld = 1U;
+
+                snprintf(msg, sizeof(msg), "servo %u us (%+d)\r\n",
+                         (unsigned)g_sweepUs,
+                         (int)g_sweepUs - (int)SERVO_CENTER_US);
+                RpiLink_Send(msg);
+            }
             else if (g_mode == MODE_IMU)
             {
                 IMU_ResetHeading();
-                RpiLink_Send("IMU heading zeroed\r\n");
+                IMU_ResetStats();
+                RpiLink_Send("IMU heading + stats zeroed\r\n");
             }
             else if (g_mode == MODE_SETDIST)
             {
@@ -601,10 +912,11 @@ int main(void)
                 /* Latch the target with the run. If it were read back at the
                    end instead, stepping the target afterwards would silently
                    rewrite the error figure for a run already finished. */
-                g_repTarget = g_targetMm;
-                g_repValid  = 0U;
-                g_runStartA = Encoder_A_GetCount();
-                g_runStartB = Encoder_B_GetCount();
+                g_repTarget   = g_targetMm;
+                g_repValid    = 0U;
+                g_lastWasTurn = 0U;
+                g_runStartA   = Encoder_A_GetCount();
+                g_runStartB   = Encoder_B_GetCount();
 
                 RpiLink_Send("\r\nA.3 run starting\r\n");
                 Motion_DriveDistance(g_targetMm);
@@ -613,6 +925,14 @@ int main(void)
             {
                 PrintSensors();
             }
+        }
+
+        /* Sweep watchdog: never leave the servo stalled against a stop. */
+        if (g_sweepHeld && ((now - g_sweepAtMs) >= SERVO_SWEEP_HOLD_MS))
+        {
+            g_sweepHeld = 0U;
+            Servo_SetRawUs(SERVO_CENTER_US);
+            RpiLink_Send("sweep timed out, centred\r\n");
         }
 
         if (now - tDisp >= 150u) { tDisp = now; Display(); }

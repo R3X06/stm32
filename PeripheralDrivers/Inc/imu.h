@@ -53,13 +53,52 @@
  * tick that integrating the latest sample each tick loses nothing.
  * ------------------------------------------------------------------------- */
 
-/* Full scale. 250 dps is the most sensitive setting and gives 131 LSB per
- * degree per second. A robot correcting its heading turns at a few tens of
- * dps at most, so the wider ranges only throw away resolution. */
-#define IMU_GYRO_FS_DPS         250.0f
-#define IMU_GYRO_LSB_PER_DPS    131.0f
+/* Full scale, and the matching sensitivity.
+ *
+ * CHANGED FROM +-250 TO +-1000 dps. 250 was clipping.
+ *
+ * The robot only turns at about 30 dps, so 250 looked like enormous headroom
+ * and the most sensitive setting looked like the obvious choice. It was
+ * wrong, twice over:
+ *
+ *   By hand   a "fast" 180 degree rotation averages 180 dps, but the motion
+ *             is not smooth - the peak mid-rotation is two or three times the
+ *             average and goes straight past 250. Everything above the limit
+ *             is discarded, so the integral comes out short.
+ *
+ *   Driving   the gearboxes shake the chassis. Vibration swinging several
+ *             hundred dps around a +30 dps mean clips HARDER ON THE POSITIVE
+ *             SIDE than the negative, because the mean is offset. That
+ *             rectifies the signal and drags the average down - which is why
+ *             a commanded 90 degree turn read 87 while the robot physically
+ *             turned about 156.
+ *
+ * The low-pass filter cannot fix this: saturation happens at the sensor,
+ * before the filter sees the signal. Only more range helps.
+ *
+ * Resolution is not a real cost. At +-1000 dps one count is 0.03 dps against
+ * a 30 dps signal - a tenth of a percent, far below the noise floor.
+ *
+ *   FS_SEL  00 = +-250 dps,  131.0 LSB/dps
+ *           01 = +-500 dps,   65.5
+ *           10 = +-1000 dps,  32.8   <- this one
+ *           11 = +-2000 dps,  16.4 */
+#define IMU_GYRO_FS_SEL         2U
+#define IMU_GYRO_FS_DPS         1000.0f
+#define IMU_GYRO_LSB_PER_DPS    32.8f
 
-/* Integration period. MUST equal the TIM6 tick. */
+/* Gyro low-pass bandwidth, GYRO_DLPFCFG.
+ *
+ *   0 = 196.6 Hz   3 = 51.2 Hz   6 = 5.7 Hz
+ *   1 = 151.8 Hz   4 = 23.9 Hz
+ *   2 = 119.5 Hz   5 = 11.6 Hz
+ *
+ * Was 0, which is 196.6 Hz against an output data rate of 102 Hz - the filter
+ * sat ABOVE Nyquist, so vibration between 51 and 196 Hz folded down into the
+ * measurement instead of being removed. 4 gives 23.9 Hz: comfortably below
+ * Nyquist, and still ten times faster than anything the chassis does. */
+#define IMU_GYRO_DLPFCFG        4U
+
 #define IMU_DT_S                0.01f
 
 /* Mounting sign. Odometry counts heading counter-clockwise positive. If the
@@ -75,13 +114,31 @@
 #define IMU_BIAS_SAMPLES        200U
 
 /* Bias larger than this in raw counts means the robot was moving during
- * calibration, or the part is faulty. 131 counts is 1 dps, which is already
- * a lot for a stationary sensor. */
-#define IMU_BIAS_SANITY_LSB     2000
+ * calibration, or the part is faulty. At 32.8 LSB/dps, 500 counts is 15 dps -
+ * already far more than a healthy part should show.
+ *
+ * This was 2000, carried over from the +-250 dps setting where it meant
+ * 15 dps. At +-1000 the same number means 61 dps, so the check had quietly
+ * stopped catching anything. */
+#define IMU_BIAS_SANITY_LSB      500
 
 /* Bring-up attempts before giving up, 100 ms apart. Covers a slow 1.8 V rail
  * and a warm MCU reset that left the sensor mid-reset. */
 #define IMU_INIT_RETRIES        5U
+
+/* Go stale if no successful read arrives for this long, ms.
+ *
+ * IMU_Poll() returns early on a failed read, which leaves the last rate in
+ * place - and IMU_Tick() goes on integrating it. If the bus drops mid-turn
+ * with the robot rotating at 100 deg/s, the heading climbs at 100 deg/s
+ * forever on a reading that is no longer being taken. Nothing detects it,
+ * because readiness was decided once at startup.
+ *
+ * The sensor updates at 102 Hz and the main loop polls far faster, so a
+ * 100 ms gap is already dozens of missed reads - comfortably a fault, not
+ * jitter. Going stale zeroes the rate, clears ready, and lets odom fall back
+ * to the encoders, which is degraded but bounded. */
+#define IMU_STALE_MS            100U
 
 /* Start-up. Call after MX_I2C2_Init(), BEFORE the TIM6 tick is started -
  * it uses HAL_Delay() and takes about 2.5 seconds, most of it bias
@@ -100,6 +157,25 @@ void IMU_Tick(void);
 /* Zero the integrated heading. Call whenever a move starts. */
 void IMU_ResetHeading(void);
 
+/* ---------------------------------------------------------------------------
+ * Zero-rate update. Call from the control tick ONLY when the robot is known
+ * to be stationary - motors idle and both encoders showing no movement.
+ *
+ * A stationary gyro's true yaw rate is exactly zero, so whatever it reads is
+ * bias, and that is a free measurement available any time the robot is
+ * standing still. Slowly pulling the stored bias toward it tracks the drift
+ * out continuously.
+ *
+ * This matters more than it did before the full scale went to +-1000 dps. One
+ * raw count is now 0.0305 dps instead of 0.0076, so the same handful of counts
+ * of residual bias integrates four times faster into the heading. And a
+ * one-shot calibration at power-on cannot hold anyway: MEMS bias moves with
+ * temperature, and boot is when the chip is coldest.
+ *
+ * The filter is deliberately slow - about a ten second time constant - so a
+ * genuine slow rotation cannot be mistaken for bias and calibrated away. */
+void IMU_TrackBias(void);
+
 /* Integrated heading in degrees, counter-clockwise positive. Free-running,
  * does NOT wrap - wrap it at the point of use if you need +-180. */
 float IMU_GetHeading(void);
@@ -116,5 +192,9 @@ uint8_t  IMU_GetWhoAmI(void);       /* should be 0xEA                       */
 int16_t  IMU_GetBias(void);         /* raw counts subtracted from every read */
 int16_t  IMU_GetRawZ(void);         /* last raw reading, before bias         */
 uint32_t IMU_GetErrorCount(void);   /* failed I2C transactions since boot    */
+uint32_t IMU_GetPollRate(void);     /* successful reads in the last second    */
+uint32_t IMU_GetStallCount(void);   /* times the gyro went stale mid-run     */
+int16_t  IMU_GetPeakRaw(void);      /* largest raw magnitude since reset      */
+void     IMU_ResetStats(void);      /* zero the poll rate and peak            */
 
 #endif /* __IMU_H */

@@ -91,33 +91,80 @@
 
 /* Set to 1 if a motor spins the wrong way for a positive speed.
  *
- * B CHANGED FROM 1 TO 0 - VERIFY THIS ON THE STAND BEFORE A FLOOR RUN.
+ * BOTH ARE 1. VERIFIED ON THE STAND - do not "correct" these from reading
+ * the code.
  *
- * These did not agree with the calibration build that was in main.c. Working
- * it through channel by channel:
+ * B was briefly changed to 0 on the theory that the Phase 2 calibration
+ * build in main.c, which had MOTOR_B_INVERT 0, was the bench-verified one.
+ * It was not. That build's comment said "Determine in M2" - it was still a
+ * placeholder. The real measurement was in the bring-up report all along:
  *
- *   Motor A: motors.c passes CH3 as in1 and CH4 as in2, so INVERT 1 puts the
- *            PWM on CH4 (PB9) for a positive speed. The calibration build put
- *            it on CH4 too. Same behaviour - A stays at 1.
+ *     MOTOR_A_INVERT  1   Positive command drove backwards
+ *     MOTOR_B_INVERT  1   Positive command drove backwards
  *
- *   Motor B: motors.c passes CH1 as in1 and CH2 as in2, so INVERT 1 put the
- *            PWM on CH2 (PE6) for a positive speed. The calibration build put
- *            it on CH1 (PE5). Opposite - so B becomes 0 to match.
+ * Flashing the 0 made wheel B run backwards on the stand, which confirms
+ * the report. A measured value beats a newer file every time.
  *
- * The calibration build is the more recent of the two and is the one that was
- * driven on the bench, so it wins. If Motor B turns out to run backwards,
- * put this back to 1 and re-check A at the same time. */
+ * For reference, the mechanism: motor_drive() puts PWM on in1_ch for a
+ * positive speed. Motor_B_Set passes CH1 as in1, so INVERT 0 drives PE5 and
+ * INVERT 1 drives PE6. PE6 is forward on this chassis. */
 #define MOTOR_A_INVERT      1
 #define MOTOR_B_INVERT      1
 
 /* Servo pulse limits, microseconds.
  * The linkage - not the servo - sets the usable range. Per the datasheet
- * handout the working span is roughly 65-85 ticks at 20 us, i.e. 1300-1700.
- * Commanding 500 or 2500 drives the steering into its mechanical stop and
- * stalls the servo. All three values are PROVISIONAL - measured in Phase 2. */
-#define SERVO_MIN_US        1250U
-#define SERVO_MAX_US        1750U
+ * MEASURED with the sweep, replacing the Phase 2 guesses of 1250/1750.
+ *
+ * Confirmed safe travel is 850 to 2125, with straight-ahead at 1500. The
+ * midpoint of that is 1487, so the linkage IS symmetric about centre - an
+ * earlier partial sweep that stopped at 1100 made it look badly offset and it
+ * is not.
+ *
+ * Limits are SYMMETRIC about 1500 on purpose: 900 and 2100, 600 us either
+ * side. Servo_SetMicroseconds() clamps to them, so an asymmetric pair would
+ * silently shorten an arc in one direction only and turns would come out
+ * lopsided with nothing on screen to say why. */
+#define SERVO_MIN_US         900U
+#define SERVO_MAX_US        2100U
 #define SERVO_CENTER_US     1500U
+
+/* Absolute safety bounds for the end-stop sweep ONLY.
+ *
+ * Servo_SetRawUs() clamps to these instead of SERVO_MIN_US/MAX_US, so the
+ * sweep can explore past the provisional limits to find where the linkage
+ * actually binds.
+ *
+ * 500-2500 is the widest range a hobby servo will accept. USE IT CAREFULLY.
+ *
+ * The limit on this robot is the STEERING LINKAGE, not the servo's travel.
+ * Once the front wheels stop moving, more pulse does not turn them further -
+ * it pushes the servo into a stop it cannot pass, at full stall torque. The
+ * HWZ020 has plastic gears and they can STRIP under that load. This is not
+ * just a heat problem; it can end the steering permanently.
+ *
+ * Step slowly, watch the WHEELS rather than the numbers, and stop the moment
+ * they stop moving. The known-good span is roughly 1300-1700; anything beyond
+ * that is unexplored and the display flags it.
+ *
+ * Nothing in normal operation should use these. */
+/* Overshoot used when settling the steering onto a target angle.
+ *
+ * The linkage has roughly 50 us of slack. Command 1500 coming DOWN from a
+ * right turn and the slack sits on one side; command 1500 coming UP from a
+ * left turn and it sits on the other. The servo is at 1500 either way, but
+ * the WHEELS end up a little right or a little left depending on which turn
+ * came last - which is exactly the "stops but does not fully align" symptom.
+ *
+ * So always arrive from the same side: go this far BELOW the target first,
+ * then come up onto it. The slack is then resolved identically every time,
+ * and whatever residual offset is left becomes a constant that
+ * SERVO_CENTER_US can absorb.
+ *
+ * Slightly larger than the measured slack so it is guaranteed to clear it. */
+#define SERVO_APPROACH_US     60U
+
+#define SERVO_ABS_MIN_US     500U
+#define SERVO_ABS_MAX_US    2500U
 
 
 void Motors_Init(void);
@@ -139,6 +186,13 @@ void Servos_Init(void);
 
 /* Pulse width in microseconds, clamped to SERVO_MIN_US..SERVO_MAX_US. */
 void Servo_SetMicroseconds(uint16_t us);
+
+/* Bypasses SERVO_MIN_US/MAX_US and clamps to SERVO_ABS_* instead. For the
+ * end-stop sweep only - it exists to find what SERVO_MIN_US and SERVO_MAX_US
+ * should be, so it cannot be bounded by them. Step gently and stop the moment
+ * the wheels stop moving or the servo starts buzzing: that is the mechanical
+ * stop, and holding against it stalls the servo. */
+void Servo_SetRawUs(uint16_t us);
 
 /* 0..180 mapped linearly across the clamped range. 90 is NOT the straight-
  * ahead position unless SERVO_CENTER_US happens to sit mid-range - use

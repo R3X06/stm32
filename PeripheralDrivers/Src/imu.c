@@ -43,6 +43,17 @@ static volatile float    s_rateDps;
 static volatile float    s_headingDeg;
 static volatile uint32_t s_errors;
 
+/* Poll rate diagnostics. IMU_Tick() integrates at a fixed 100 Hz using
+ * whatever sample IMU_Poll() last fetched, so if the main loop is not
+ * polling at least as fast as the sensor updates (102 Hz), samples go
+ * unseen - and during a fast rotation the unseen ones are exactly the
+ * large ones. This counts what is actually happening. */
+static volatile uint32_t s_polls;
+static volatile uint32_t s_pollRate;
+static volatile int16_t  s_peakRaw;
+static volatile uint32_t s_lastGoodMs;
+static volatile uint32_t s_stalls;
+
 /* ------------------------------------------------------------------ */
 /* Register access                                                     */
 /* ------------------------------------------------------------------ */
@@ -154,14 +165,13 @@ static uint8_t imu_bringup(void)
 
     /* GYRO_CONFIG_1:
      *   bit    0  GYRO_FCHOICE  1 = enable the low-pass filter
-     *   bits 2:1  GYRO_FS_SEL   00 = +-250 dps
-     *   bits 5:3  GYRO_DLPFCFG  000 = 196.6 Hz bandwidth
+     *   bits 2:1  GYRO_FS_SEL   full scale
+     *   bits 5:3  GYRO_DLPFCFG  bandwidth
      *
-     * The filter matters more than it looks. Motor PWM at 20 kHz and the
-     * gearbox put real mechanical vibration into the chassis; unfiltered,
-     * that lands in the gyro output and gets integrated straight into the
-     * heading. */
-    if (!reg_write(B2_GYRO_CONFIG_1, 0x01U))               { return 0U; }
+     * See imu.h for why the full scale is +-1000 and not +-250. */
+    if (!reg_write(B2_GYRO_CONFIG_1,
+                   (uint8_t)((IMU_GYRO_DLPFCFG << 3) |
+                             (IMU_GYRO_FS_SEL  << 1) | 1U)))  { return 0U; }
 
     if (!bank_select(0U))                                  { return 0U; }
     HAL_Delay(50);
@@ -183,6 +193,8 @@ uint8_t IMU_Init(I2C_HandleTypeDef *hi2c)
     s_rateDps    = 0.0f;
     s_headingDeg = 0.0f;
     s_errors     = 0U;
+    s_lastGoodMs = HAL_GetTick();
+    s_stalls     = 0U;
 
     /* nCS high selects I2C. Without this the part sits in SPI mode and will
      * not acknowledge at any address. */
@@ -206,6 +218,12 @@ uint8_t IMU_Init(I2C_HandleTypeDef *hi2c)
         s_ready = 0U;
         return 0U;
     }
+
+    /* Start the staleness clock from HERE, not from the top of init. The
+     * control tick begins right after this returns and checks staleness on
+     * its very first pass, possibly before the main loop has managed a single
+     * IMU_Poll(). Anything older than this moment is startup, not a fault. */
+    s_lastGoodMs = HAL_GetTick();
 
     return 1U;
 }
@@ -234,6 +252,12 @@ uint8_t IMU_CalibrateBias(void)
         {
             sum += (int16_t)(((uint16_t)buf[0] << 8) | buf[1]);
             got++;
+
+            /* Keep the staleness timer alive. This loop reads the sensor
+             * directly rather than through IMU_Poll(), so without this the
+             * 2.5 seconds spent here look like 2.5 seconds of no data and the
+             * gyro is declared stale before it has ever been polled. */
+            s_lastGoodMs = HAL_GetTick();
         }
         HAL_Delay(10);
     }
@@ -267,17 +291,67 @@ void IMU_Poll(void)
 
     if (!s_ready) { return; }
 
-    if (!reg_read(B0_GYRO_ZOUT_H, buf, 2U)) { return; }
+    if (!reg_read(B0_GYRO_ZOUT_H, buf, 2U))
+    {
+        /* Deliberately do NOT touch s_rateDps here - IMU_Tick() decides what
+         * to do about a gap, based on how long it has been going on. */
+        return;
+    }
 
     raw = (int16_t)(((uint16_t)buf[0] << 8) | buf[1]);
 
-    s_rawZ    = raw;
-    s_rateDps = (float)(raw - s_bias) / IMU_GYRO_LSB_PER_DPS;
+    s_rawZ       = raw;
+    s_rateDps    = (float)(raw - s_bias) / IMU_GYRO_LSB_PER_DPS;
+    s_lastGoodMs = HAL_GetTick();
+
+    s_polls++;
+
+    /* Largest magnitude seen since the last reset. If this ever approaches
+     * 32767 the gyro is clipping at its full-scale limit and every reading
+     * above it is lost - which would under-report a fast turn exactly the
+     * way a scale error does. */
+    {
+        int16_t mag = (raw < 0) ? (int16_t)(-raw) : raw;
+        if (mag > s_peakRaw) { s_peakRaw = mag; }
+    }
 }
+
+void IMU_ResetStats(void)
+{
+    s_polls    = 0U;
+    s_pollRate = 0U;
+    s_peakRaw  = 0;
+}
+
+uint32_t IMU_GetPollRate(void) { return s_pollRate; }
+int16_t  IMU_GetPeakRaw(void)  { return s_peakRaw; }
 
 void IMU_Tick(void)
 {
+    static uint16_t ticks = 0U;
+
     if (!s_ready) { return; }
+
+    /* Staleness check FIRST. A frozen rate integrated forever is worse than
+     * no heading at all: it is confidently wrong, and everything downstream -
+     * heading hold, cross-track, arc termination - acts on it. */
+    if ((HAL_GetTick() - s_lastGoodMs) > IMU_STALE_MS)
+    {
+        s_rateDps = 0.0f;   /* stop integrating garbage */
+        s_ready   = 0U;     /* odom falls back to the encoders */
+        s_stalls++;
+        return;
+    }
+
+    /* Once a second, latch how many polls happened. Should be well above
+     * 102; anywhere near or below it means the main loop is the bottleneck. */
+    ticks++;
+    if (ticks >= 100U)
+    {
+        ticks      = 0U;
+        s_pollRate = s_polls;
+        s_polls    = 0U;
+    }
 
     /* Rectangular integration at a fixed step. Trapezoidal would be more
      * accurate in principle, but the sample rate is barely above the tick
@@ -288,6 +362,30 @@ void IMU_Tick(void)
      * from registering, and the whole point of measuring the bias properly
      * is that it makes one unnecessary. */
     s_headingDeg += s_rateDps * IMU_DT_S * (float)IMU_Z_SIGN;
+}
+
+void IMU_TrackBias(void)
+{
+    /* s_bias is an integer count, so a plain EMA would never move for small
+     * errors - the update would round to zero every time. Accumulate the
+     * error in a wider running sum instead and shift a count across only when
+     * the sum has genuinely built up. */
+    static int32_t accum = 0;
+
+    if (!s_ready) { return; }
+
+    accum += ((int32_t)s_rawZ - (int32_t)s_bias);
+
+    if (accum > 1024)
+    {
+        s_bias++;
+        accum = 0;
+    }
+    else if (accum < -1024)
+    {
+        s_bias--;
+        accum = 0;
+    }
 }
 
 void IMU_ResetHeading(void)
@@ -308,3 +406,4 @@ uint8_t  IMU_GetWhoAmI(void)     { return s_whoami; }
 int16_t  IMU_GetBias(void)       { return s_bias; }
 int16_t  IMU_GetRawZ(void)       { return s_rawZ; }
 uint32_t IMU_GetErrorCount(void) { return s_errors; }
+uint32_t IMU_GetStallCount(void)  { return s_stalls; }

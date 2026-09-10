@@ -174,6 +174,71 @@
  * difference. */
 #define SERVO_BACKLASH_US   25.0f
 
+/* ---------------------------------------------------------------------------
+ * LEARNED CENTRE TRIM
+ *
+ * SERVO_CENTER_US is where the steering is BELIEVED to be straight. If it is
+ * off, P alone can never fix it: P only reacts to an error that already
+ * exists, so the robot drifts until the error is big enough to correct, gets
+ * pushed back, and drifts again. The deadband hides small offsets entirely.
+ *
+ * THIS IS LEARNED BETWEEN RUNS, NOT DURING THEM.
+ *
+ * The obvious answer is an integral term in the heading loop. I tried that
+ * and it made both straightness AND distance worse, for one reason: this
+ * linkage has about 50 us of backlash. An integral winds up while the slack
+ * means nothing mechanical is happening, the linkage then engages all at
+ * once, it over-corrects, and the robot weaves. A weaving path is also longer
+ * than a straight one, so the odometry over-reads against a tape measure -
+ * which is why a steering change appeared to break distance accuracy.
+ *
+ * So instead: accumulate the mean heading error across a whole run, and adjust
+ * the trim ONCE when the run finishes. The trim is a fixed servo offset while
+ * driving, so the inner loop is exactly what it was before and cannot be
+ * destabilised. Same shape as the arc deceleration learning.
+ *
+ * The trim is in SERVO space, so it is NOT flipped when reversing, while the
+ * proportional term is. A mechanical offset is the same offset either way. */
+/* ---------------------------------------------------------------------------
+ * CROSS-TRACK CORRECTION
+ *
+ * Heading hold controls DIRECTION, not POSITION. If the robot yaws a degree
+ * and the loop corrects it back to zero, the robot is pointing straight again
+ * - but it is now travelling on a line PARALLEL to the original one, offset
+ * sideways. Every transient yaw leaves a permanent displacement and a
+ * heading-only loop never brings it back. That is why the robot finishes
+ * straight but shifted.
+ *
+ * The fix is to steer toward the LINE rather than toward a heading. odom
+ * already tracks y_mm, so the loop aims at a heading leaning back to zero:
+ *
+ *      aim = -CROSS_KP_DEG_PER_MM * y_mm      (clamped)
+ *
+ * 10 mm off asks for 0.8 degrees of lean, 50 mm asks for 4.
+ *
+ * KEEP THE GAIN LOW. Steering angle integrates into heading and heading
+ * integrates into position, so this closes a loop around TWO integrators -
+ * inherently more prone to oscillation than heading hold alone. Too much gain
+ * and the robot weaves across the line instead of settling on it, and a
+ * weaving path is longer than a straight one so it costs distance accuracy
+ * as well as straightness.
+ *
+ * IF IT WEAVES: halve CROSS_KP_DEG_PER_MM before changing anything else, and
+ * re-check the tape measure as well as the line. Set CROSS_TRACK_ENABLE to 0
+ * to remove it entirely.
+ *
+ * y_mm is dead reckoning, integrated from heading and distance. Over a metre
+ * with this calibration that is reliable to a few mm, but it is not an
+ * absolute position - it can only return the robot to where it BELIEVES the
+ * line was. */
+#define CROSS_TRACK_ENABLE      1
+#define CROSS_KP_DEG_PER_MM     0.08f
+#define CROSS_MAX_DEG           8.0f
+
+#define HEADING_TRIM_GAIN   4.0f    /* us of trim per degree of mean error */
+#define HEADING_TRIM_MAX_US 80.0f
+#define ODOM_DT_S           0.01f
+
 /* Sign convention: which way a positive heading error should steer.
  *
  * CHANGED FROM +1 TO -1 WHEN HEADING MOVED TO THE GYRO. The two heading
@@ -225,6 +290,16 @@ void Odom_Update(void);
 void Odom_GetPose(Odom_Pose_t *out);
 
 float Odom_GetHeading(void);
+
+/* Heading since the last Odom_Reset(), degrees, NOT wrapped. Positive follows
+ * whichever source ODOM_HEADING_SOURCE selects. Use this for turns - a 270
+ * degree arc must read 270, and the wrapped value would read -90. */
+float Odom_GetHeadingTotal(void);
+
+/* Yaw rate from the last tick, degrees per second, signed. Comes from
+ * whichever source ODOM_HEADING_SOURCE selects, so it works with the encoder
+ * fallback too. Used to predict how far the robot will coast after braking. */
+float Odom_GetRateDps(void);
 float Odom_GetDistance(void);
 
 /* ------------------------------------------------------------------ */
@@ -273,7 +348,40 @@ void Odom_SetSpeed(int16_t rpm);
  *
  * right: 1 to curve right (Motor B inner), 0 to curve left (Motor A inner).
  * Negative rpm reverses. */
-void Odom_DriveArc(int16_t rpm, uint16_t servo_us, float radius_mm, uint8_t right);
+void Odom_DriveArc(int16_t rpm, uint16_t servo_us, float radius_mm,
+                   uint8_t right, float diff_boost);
+
+/* ---------------------------------------------------------------------------
+ * Differential assist - deliberate over-differential to tighten a turn.
+ *
+ * 1.0 splits the two rear wheel speeds to match the steering geometry
+ * exactly, so neither tyre scrubs. That is the "correct" value and it leaves
+ * the turn radius entirely to the front wheels.
+ *
+ * Above 1.0 the outer wheel is driven faster than the geometry asks and the
+ * inner slower. The pair now exerts a yaw moment on the chassis - the same
+ * thing a skid-steer uses to turn - and the robot rotates faster than the
+ * steering alone would carry it. The turn tightens.
+ *
+ * WHAT IT COSTS
+ *   Tyre scrub, because the rear wheels are no longer rolling along the paths
+ *   the geometry says they should. On a smooth floor that shows up as a
+ *   slight rear slide.
+ *
+ *   Encoder odometry gets less honest for the same reason - the wheels turn
+ *   further than the ground travelled. Distance during an arc is affected;
+ *   the ANGLE is not, because the gyro measures the body directly. That is
+ *   what makes this safe to use at all.
+ *
+ * WHERE IT STOPS
+ *   The inner wheel slows as boost rises, and below about 55 rpm the deadband
+ *   clamp takes over and the PID stops regulating it. ODOM_ARC_DIFF_MAX caps
+ *   the split so the inner wheel can never be commanded below half the centre
+ *   speed however large the boost is set.
+ *
+ * Try 1.5, measure R, then 2.0. Expect diminishing returns and a rear end
+ * that feels progressively looser. */
+#define ODOM_ARC_DIFF_MAX     0.50f
 
 /* Stops the robot, recentres the steering, disables heading hold. */
 void Odom_Stop(void);
@@ -285,6 +393,19 @@ uint16_t Odom_GetServoUs(void);
 
 /* Heading error the loop is currently acting on, degrees. Also for tuning. */
 float Odom_GetHeadingError(void);
+
+/* Learned steering centre offset in microseconds. Once it settles, add it to
+ * SERVO_CENTER_US in motors.h and it will start from zero again. */
+float Odom_GetHeadingTrim(void);
+
+/* Signed distance left of the line the current move started on, mm. This is
+ * the quantity the cross-track term drives to zero. */
+float Odom_GetCrossTrack(void);
+
+/* Fold this run's mean heading error into the trim. Call ONCE when a straight
+ * move finishes, from the motion layer. Does nothing if the run was too short
+ * to have collected a meaningful average. */
+void Odom_LearnTrim(void);
 
 /* ------------------------------------------------------------------ */
 /* Calibration helper                                                  */

@@ -14,6 +14,12 @@ static int32_t s_lastCountB;
  * IMU's free-running total. */
 static float   s_lastImuHeading;
 
+/* Unwrapped heading, degrees, since the last Odom_Reset(). s_pose.heading_deg
+ * is wrapped to +-180 because the heading-hold loop needs a bounded error;
+ * an arc needs the opposite - a 270 degree turn has to read 270, not -90. */
+static float   s_headingTotal;
+static float   s_rateDps;
+
 /* Drive mode. OFF means nothing here touches the motors or the servo. */
 typedef enum
 {
@@ -37,6 +43,9 @@ static uint8_t  s_holdActive;
 static int16_t  s_holdRpm;
 static float    s_holdHeading;
 static float    s_error;
+static float    s_headingTrim;   /* learned centre offset, us */
+static float    s_errSum;        /* mean-error accumulator, this run */
+static uint32_t s_errCount;
 static uint16_t s_servoUs;
 
 /* Spin calibration state */
@@ -46,6 +55,27 @@ static int32_t s_spinStartB;
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
+
+/* Heading change from the wheel difference, degrees.
+ *
+ * NOTE THE MINUS SIGN. Without it this is the OPPOSITE SIGN to the gyro, and
+ * that is not a cosmetic difference - it inverts the feedback.
+ *
+ * Motor A is the LEFT rear. On a left (counter-clockwise) turn the left wheel
+ * is on the inside and travels less, so (dA - dB) is negative: the raw
+ * expression is CLOCKWISE-positive. The gyro is counter-clockwise-positive.
+ *
+ * This bit us. On a run where the IMU had not come up, the fallback silently
+ * handed the heading loop and the arc logic a sign-flipped heading. A
+ * commanded 90 degree right turn ran to 369 degrees before the watchdog
+ * stopped it, because "degrees still to go" was growing instead of shrinking.
+ *
+ * A fallback that inverts the sign is worse than no fallback at all - it
+ * fails loudly in the wrong direction instead of quietly losing accuracy.
+ * With the minus sign both sources agree, so HEADING_SIGN and
+ * MOTION_ARC_SIGN stay valid whichever one is in use. */
+#define ODOM_ENCODER_HEADING() \
+    (-((dA_mm - dB_mm) / WHEEL_BASE_MM) * (180.0f / 3.14159265f))
 
 /* Keeps an angle in -180..+180. Without this, heading errors across the
  * +-180 boundary come out as ~360 degrees and the correction slams the
@@ -93,6 +123,7 @@ void Odom_Reset(void)
     s_pose.y_mm        = 0.0f;
     s_pose.heading_deg = 0.0f;
     s_pose.distance_mm = 0.0f;
+    s_headingTotal     = 0.0f;
 
     /* Resync the cached counts against the live encoders.
      *
@@ -179,10 +210,10 @@ void Odom_Update(void)
     }
     else
     {
-        d_theta_deg = ((dA_mm - dB_mm) / WHEEL_BASE_MM) * (180.0f / 3.14159265f);
+        d_theta_deg = ODOM_ENCODER_HEADING();
     }
 #else
-    d_theta_deg = ((dA_mm - dB_mm) / WHEEL_BASE_MM) * (180.0f / 3.14159265f);
+    d_theta_deg = ODOM_ENCODER_HEADING();
 #endif
 
     /* Integrate at the midpoint heading rather than the start heading. */
@@ -192,6 +223,8 @@ void Odom_Update(void)
     s_pose.y_mm += d_centre * sinf(heading_rad);
 
     s_pose.heading_deg = wrap180(s_pose.heading_deg + d_theta_deg);
+    s_headingTotal    += d_theta_deg;
+    s_rateDps          = d_theta_deg * 100.0f;   /* 10 ms tick */
 
     /* Path length, always positive, so reversing does not subtract from it. */
     s_pose.distance_mm += (d_centre < 0.0f) ? -d_centre : d_centre;
@@ -206,9 +239,33 @@ void Odom_Update(void)
     }
     else if (s_holdActive)
     {
-        s_error = wrap180(s_holdHeading - s_pose.heading_deg);
+        /* Aim slightly off the held heading, leaning back toward the line.
+         *
+         * y_mm is left-positive and heading is counter-clockwise positive, so
+         * being LEFT of the line calls for a NEGATIVE (rightward) aim - hence
+         * the minus sign. Reversing flips it: backing up, leaning the nose
+         * right moves the tail left. */
+        {
+            float aim = s_holdHeading;
+
+#if CROSS_TRACK_ENABLE
+            float cross = -CROSS_KP_DEG_PER_MM * s_pose.y_mm;
+
+            cross = clampf(cross, -CROSS_MAX_DEG, CROSS_MAX_DEG);
+            if (s_holdRpm < 0) { cross = -cross; }
+
+            aim += cross;
+#endif
+            s_error = wrap180(aim - s_pose.heading_deg);
+        }
 
         /* Deadband. Below this the servo would only hunt and buzz. */
+        /* Collect the error for the between-runs trim update. Accumulating
+         * is safe; ACTING on it inside the run is what destabilised the loop
+         * against the linkage backlash. */
+        s_errSum += s_error * ((s_holdRpm < 0) ? -1.0f : 1.0f);
+        s_errCount++;
+
         if ((s_error < HEADING_DEADBAND_DEG) && (s_error > -HEADING_DEADBAND_DEG))
         {
             correction = 0.0f;
@@ -230,7 +287,9 @@ void Odom_Update(void)
             correction = clampf(correction, -HEADING_MAX_US, HEADING_MAX_US);
         }
 
-        s_servoUs = (uint16_t)((float)SERVO_CENTER_US + correction);
+        /* Trim added AFTER the direction flip - it is a servo-space constant,
+         * not a heading-space correction. */
+        s_servoUs = (uint16_t)((float)SERVO_CENTER_US + correction + s_headingTrim);
         Servo_SetMicroseconds(s_servoUs);   /* clamps to MIN/MAX internally */
 
         /* Both rear wheels at the same speed. The PID's only job now is to
@@ -248,9 +307,13 @@ void Odom_GetPose(Odom_Pose_t *out)
 }
 
 float    Odom_GetHeading(void)      { return s_pose.heading_deg; }
+float    Odom_GetHeadingTotal(void) { return s_headingTotal; }
+float    Odom_GetRateDps(void)      { return s_rateDps; }
 float    Odom_GetDistance(void)     { return s_pose.distance_mm; }
 uint16_t Odom_GetServoUs(void)      { return s_servoUs; }
 float    Odom_GetHeadingError(void) { return s_error; }
+float    Odom_GetHeadingTrim(void)  { return s_headingTrim; }
+float    Odom_GetCrossTrack(void)   { return s_pose.y_mm; }
 
 /* ------------------------------------------------------------------ */
 /* Heading hold                                                        */
@@ -280,8 +343,31 @@ void Odom_DriveStraight(int16_t rpm)
     Odom_DriveHeading(rpm, s_pose.heading_deg);
 }
 
+void Odom_LearnTrim(void)
+{
+    float mean;
+
+    /* Too few samples to mean anything - a very short move, or one that was
+     * aborted before the heading loop had settled. */
+    if (s_errCount < 50U) { return; }
+
+    mean = s_errSum / (float)s_errCount;
+
+    /* A positive mean error means the robot sat to one side for the whole
+     * run, which is exactly a centre offset. HEADING_SIGN converts heading
+     * degrees into the servo direction that cancels them. */
+    s_headingTrim += mean * HEADING_TRIM_GAIN * (float)HEADING_SIGN;
+    s_headingTrim  = clampf(s_headingTrim,
+                            -HEADING_TRIM_MAX_US, HEADING_TRIM_MAX_US);
+
+    s_errSum   = 0.0f;
+    s_errCount = 0U;
+}
+
 void Odom_DriveHeading(int16_t rpm, float heading_deg)
 {
+    s_errSum      = 0.0f;
+    s_errCount    = 0U;
     s_holdHeading = wrap180(heading_deg);
     s_holdRpm     = rpm;
     s_error       = 0.0f;
@@ -292,7 +378,8 @@ void Odom_DriveHeading(int16_t rpm, float heading_deg)
     s_mode        = ODOM_STRAIGHT;
 }
 
-void Odom_DriveArc(int16_t rpm, uint16_t servo_us, float radius_mm, uint8_t right)
+void Odom_DriveArc(int16_t rpm, uint16_t servo_us, float radius_mm,
+                   uint8_t right, float diff_boost)
 {
     float half_track = WHEEL_BASE_MM * 0.5f;
     float inner_scale;
@@ -307,8 +394,17 @@ void Odom_DriveArc(int16_t rpm, uint16_t servo_us, float radius_mm, uint8_t righ
         radius_mm = half_track + 1.0f;
     }
 
-    inner_scale = (radius_mm - half_track) / radius_mm;
-    outer_scale = (radius_mm + half_track) / radius_mm;
+    /* Geometric split, then the assist. ratio is how far each wheel departs
+     * from the centre speed; boosting it exaggerates the difference without
+     * moving the mean, so the axle centre still runs at the requested rpm. */
+    {
+        float ratio = (half_track / radius_mm) * diff_boost;
+
+        if (ratio > ODOM_ARC_DIFF_MAX) { ratio = ODOM_ARC_DIFF_MAX; }
+
+        inner_scale = 1.0f - ratio;
+        outer_scale = 1.0f + ratio;
+    }
 
     /* Scale about the axle-centre speed so the CENTRE runs at the requested
      * rpm. That keeps Odom_GetDistance(), which averages the two wheels,

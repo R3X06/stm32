@@ -2,6 +2,8 @@
 #include "odom.h"
 #include "pid.h"
 #include "motors.h"
+#include "encoders.h"
+#include <math.h>
 
 typedef enum { MOVE_STRAIGHT = 0, MOVE_ARC } MoveKind_t;
 
@@ -17,6 +19,88 @@ static uint32_t s_ticks;
 static uint32_t s_brakeTicks;
 static uint32_t s_alignTicks;
 static uint16_t s_startServoUs;
+static float    s_arcTargetDeg;   /* signed, unwrapped, relative to launch */
+static uint16_t s_settleTarget;   /* servo angle being settled onto        */
+
+/* ---------------------------------------------------------------------------
+ * Arc profiles.
+ *
+ * ONLY PROFILE 0 IS CALIBRATED. Its brake_deg and radius_mm come from three
+ * measured runs each. The other two carry copied guesses and WILL be wrong
+ * until they are measured the same way - run a 90, read the err and the R off
+ * the turn screen, put them here.
+ * ------------------------------------------------------------------------- */
+static const ArcProfile_t s_profiles[MOTION_ARC_PROFILE_COUNT] =
+{
+    /* 0: the calibrated one. Tight and quick.                              */
+    { "TIGHT", 575U, 150, 100, 20.0f,   8.0f, 291.0f, 2.0f },
+
+    /* 1: no differential assist. Wider, but the rear tyres are not scrubbed
+     *    so the path should be a cleaner circle - which matters more than
+     *    radius if the planner needs the robot to finish where it predicted.
+     *    MEASURE brake_deg and radius_mm. */
+    { "CLEAN", 575U, 150, 100, 20.0f,   8.0f, 340.0f, 1.0f },
+
+    /* 2: slow. Longer to execute, but the coast is much smaller so the stop
+     *    is more repeatable, and the inner wheel has plenty of margin above
+     *    the deadband. MEASURE brake_deg and radius_mm. */
+    { "SLOW",  575U,  70,  70, 15.0f,   3.0f, 306.0f, 1.5f }
+};
+
+static uint8_t s_profileIdx = 0U;
+
+/* Learned angular deceleration and the state needed to measure it. */
+static float s_arcDecel   = MOTION_ARC_DECEL_DPS2;
+static float s_brakeRate  = 0.0f;   /* |yaw rate| when braking started */
+static float s_brakeAngle = 0.0f;   /* |heading| when braking started  */
+static float s_arcLag     = MOTION_ARC_LAG_S;
+
+/* Cross-check results for the last arc. */
+static float   s_xcheckDeg    = 0.0f;
+static float   s_xcheckErrPct = 0.0f;
+static uint8_t s_xcheckFailed = 0U;
+static float   s_arcStartDist = 0.0f;
+
+float   Motion_GetXCheckDeg(void)    { return s_xcheckDeg; }
+float   Motion_GetXCheckErrPct(void) { return s_xcheckErrPct; }
+uint8_t Motion_XCheckFailed(void)    { return s_xcheckFailed; }
+
+float Motion_GetArcDecel(void) { return s_arcDecel; }
+float Motion_GetArcLag(void)   { return s_arcLag; }
+
+static const ArcProfile_t *prof(void) { return &s_profiles[s_profileIdx]; }
+
+/* Clamp the deflection to what the servo limits allow on the TIGHTER side.
+ *
+ * Servo_SetMicroseconds() clamps silently, so an over-large deflection would
+ * shorten one direction only and turns would come out lopsided with nothing
+ * on screen to say why. Taking the smaller of the two available sides keeps
+ * left and right identical whatever a profile asks for. */
+static uint16_t arc_steer_us(void)
+{
+    uint16_t hi = (uint16_t)(SERVO_MAX_US - SERVO_CENTER_US);
+    uint16_t lo = (uint16_t)(SERVO_CENTER_US - SERVO_MIN_US);
+    uint16_t cap = (hi < lo) ? hi : lo;
+
+    return (prof()->steer_us > cap) ? cap : prof()->steer_us;
+}
+
+void Motion_SetArcProfile(uint8_t idx)
+{
+    if (idx < MOTION_ARC_PROFILE_COUNT) { s_profileIdx = idx; }
+}
+
+uint8_t  Motion_GetArcProfile(void)  { return s_profileIdx; }
+uint16_t Motion_GetArcSteerUs(void)  { return arc_steer_us(); }
+
+const ArcProfile_t *Motion_GetArcProfileInfo(uint8_t idx)
+{
+    return (idx < MOTION_ARC_PROFILE_COUNT) ? &s_profiles[idx] : &s_profiles[0];
+}
+
+static int16_t  s_arcCommandDeg;  /* what the caller ASKED for, uncompensated */
+static uint8_t  s_recentreStep;   /* 0 waiting to stop, 1 preloaded, 2 done */
+static uint16_t s_recentreTick;
 
 /* ---------------------------------------------------------------------------
  * MEASURING MOTION_BRAKE_MM
@@ -88,10 +172,15 @@ static void motion_begin_align(uint16_t servo_us)
                                      : (uint16_t)(servo_us - now);
 
     s_startServoUs = servo_us;
+    s_settleTarget = servo_us;
 
     PID_Enable(0);
     Motors_Coast();
-    Servo_SetMicroseconds(servo_us);
+
+    /* Approach from BELOW, always. See SERVO_APPROACH_US in motors.h - this
+     * is what makes the linkage slack resolve the same way every time
+     * instead of depending on which direction the last move left it. */
+    Servo_SetMicroseconds((uint16_t)(servo_us - SERVO_APPROACH_US));
 
     /* Already there - no point waiting for a servo that will not move.
      *
@@ -114,16 +203,21 @@ static void motion_launch(void)
 {
     Odom_Reset();
 
+    s_arcStartDist = Odom_GetDistance();   /* zero, just after the reset */
+
     s_ticks      = 0U;
     s_brakeTicks = 0U;
-    s_lastRpm    = (int16_t)(s_dir * MOTION_CRUISE_RPM);
+    s_lastRpm    = (s_kind == MOVE_ARC)
+                 ? (int16_t)(s_dir * prof()->rpm)
+                 : (int16_t)(s_dir * MOTION_CRUISE_RPM);
     s_state      = MOTION_RUN;
 
     PID_Enable(1);
 
     if (s_kind == MOVE_ARC)
     {
-        Odom_DriveArc(s_lastRpm, s_arcServoUs, MOTION_ARC_RADIUS_MM, s_arcRight);
+        Odom_DriveArc(s_lastRpm, s_arcServoUs, prof()->radius_mm,
+                      s_arcRight, prof()->diff_boost);
     }
     else
     {
@@ -146,6 +240,10 @@ void Motion_Init(void)
     s_brakeTicks  = 0U;
     s_alignTicks  = 0U;
     s_startServoUs = SERVO_CENTER_US;
+    s_recentreStep = 0U;
+    s_recentreTick = 0U;
+    s_arcTargetDeg = 0.0f;
+    s_arcCommandDeg = 0;
 }
 
 void Motion_DriveDistance(int32_t mm)
@@ -184,14 +282,51 @@ void Motion_DriveArc(int16_t degrees, uint8_t forward, uint8_t right)
     s_arcRight = right ? 1U : 0U;
 
     s_arcServoUs = right
-                 ? (uint16_t)((float)SERVO_CENTER_US + MOTION_ARC_STEER_US)
-                 : (uint16_t)((float)SERVO_CENTER_US - MOTION_ARC_STEER_US);
+                 ? (uint16_t)(SERVO_CENTER_US + arc_steer_us())
+                 : (uint16_t)(SERVO_CENTER_US - arc_steer_us());
 
-    rad    = (float)degrees * (3.14159265f / 180.0f);
-    arc_mm = MOTION_ARC_RADIUS_MM * rad;
+    /* Which way the BODY rotates.
+     *
+     * Steering right and driving forward swings the nose right, which is
+     * clockwise - and heading counts counter-clockwise positive, so the
+     * target is negative. Reversing with the same steering angle swings the
+     * nose the other way, so the sign flips again.
+     *
+     *      forward + right  ->  -degrees
+     *      forward + left   ->  +degrees
+     *      reverse + right  ->  +degrees
+     *      reverse + left   ->  -degrees
+     *
+     * VERIFY THIS ON THE ROBOT before trusting a 360. If a commanded FR90
+     * turns left, or runs away instead of stopping, invert the expression -
+     * it means the heading source counts the other way round on your build. */
+#if MOTION_ARC_ADAPTIVE_BRAKE
+    /* Aim for the full commanded angle. The tick decides when to brake by
+     * predicting the coast from the live yaw rate. */
+    rad = (float)degrees;
+#else
+    rad = (float)degrees - prof()->brake_deg;
+#endif
+    if (rad < 0.0f) { rad = 0.0f; }
 
-    arc_mm -= MOTION_BRAKE_MM;
-    if (arc_mm < 0.0f) { arc_mm = 0.0f; }
+    /* Keep the commanded angle so the result screen can report error against
+     * what was ASKED for. Reporting against s_arcTargetDeg instead compares
+     * the outcome to the brake-compensated internal target, so a perfectly
+     * executed turn shows an error equal to MOTION_ARC_BRAKE_DEG forever. */
+    s_arcCommandDeg = degrees;
+    if (right)    { s_arcCommandDeg = (int16_t)(-s_arcCommandDeg); }
+    if (!forward) { s_arcCommandDeg = (int16_t)(-s_arcCommandDeg); }
+    s_arcCommandDeg = (int16_t)(s_arcCommandDeg * MOTION_ARC_SIGN);
+
+    s_arcTargetDeg = rad;
+    if (right)    { s_arcTargetDeg = -s_arcTargetDeg; }
+    if (!forward) { s_arcTargetDeg = -s_arcTargetDeg; }
+    s_arcTargetDeg *= (float)MOTION_ARC_SIGN;
+
+    /* Distance is not the termination condition any more, but keep a
+     * generous arc-length estimate so Motion_GetRemaining() and the OLED
+     * still show something sensible. */
+    arc_mm     = prof()->radius_mm * ((float)degrees * (3.14159265f / 180.0f));
     s_targetMm = arc_mm;
 
     /* An arc needs a much bigger steering movement than a straight line, so
@@ -206,6 +341,15 @@ void Motion_Stop(void)
     uint32_t pm = crit_enter();
 
     motion_halt();
+
+    /* Reset the recentre sequence. Aborting mid-brake used to leave this
+     * part-way through, and the NEXT move's brake phase would then skip the
+     * "wait until the wheels have stopped" check and swing the servo while
+     * the robot was still coasting - reintroducing the sideways nudge on
+     * every stop, but only after an abort, which made it look intermittent. */
+    s_recentreStep = 0U;
+    s_recentreTick = 0U;
+
     s_state = MOTION_IDLE;
 
     crit_exit(pm);
@@ -232,6 +376,13 @@ void Motion_Tick(void)
     if (s_state == MOTION_ALIGN)
     {
         s_alignTicks++;
+
+        /* Halfway through the settle, come UP onto the target. */
+        if (s_alignTicks == (MOTION_ALIGN_TICKS / 2U))
+        {
+            Servo_SetMicroseconds(s_settleTarget);
+        }
+
         if (s_alignTicks >= MOTION_ALIGN_TICKS)
         {
             motion_launch();
@@ -259,6 +410,74 @@ void Motion_Tick(void)
 
     if (s_state == MOTION_RUN)
     {
+        /* An arc ends on ANGLE, a straight line on DISTANCE. */
+        if (s_kind == MOVE_ARC)
+        {
+            float turned = Odom_GetHeadingTotal();
+            float togo   = (s_arcTargetDeg >= 0.0f)
+                         ? (s_arcTargetDeg - turned)
+                         : (turned - s_arcTargetDeg);
+
+            {
+                float lead = 0.0f;
+#if MOTION_ARC_ADAPTIVE_BRAKE
+                /* Predict the coast from the rate we are turning at RIGHT NOW.
+                 * A faster profile has a larger w and so brakes earlier, with
+                 * nothing to retune. */
+                float w = Odom_GetRateDps();
+                if (w < 0.0f) { w = -w; }
+
+                /* Quadratic term is the coast once braking; linear term is
+                 * the distance covered during the engagement lag. */
+                lead = ((w * w) / (2.0f * s_arcDecel)) + (w * s_arcLag);
+                if (lead < MOTION_ARC_MIN_LEAD_DEG)
+                {
+                    lead = MOTION_ARC_MIN_LEAD_DEG;
+                }
+#endif
+                if (togo <= lead)
+                {
+                    /* Remember what we were doing at brake onset - this is
+                     * what makes the coast measurable afterwards. */
+                    s_brakeRate  = (Odom_GetRateDps() < 0.0f)
+                                 ? -Odom_GetRateDps() : Odom_GetRateDps();
+                    s_brakeAngle = (turned < 0.0f) ? -turned : turned;
+
+                    motion_halt();
+                    s_brakeTicks = 0U;
+                    s_state      = MOTION_BRAKE;
+                    return;
+                }
+            }
+
+            /* Going the wrong way. togo starts at the full turn and should
+             * only shrink; if it has grown well past its starting value the
+             * robot is rotating away from the target and will never arrive.
+             * Stop now rather than let the watchdog run the full 15 s. */
+            {
+                float target_mag = (s_arcTargetDeg >= 0.0f)
+                                 ? s_arcTargetDeg : -s_arcTargetDeg;
+
+                if (togo > (target_mag + MOTION_ARC_WRONGWAY_DEG))
+                {
+                    motion_halt();
+                    s_state = MOTION_TIMEOUT;
+                    return;
+                }
+            }
+
+            want = (togo <= prof()->approach_deg)
+                 ? (int16_t)(s_dir * prof()->approach_rpm)
+                 : (int16_t)(s_dir * prof()->rpm);
+
+            if (want != s_lastRpm)
+            {
+                motion_issue(want);
+                s_lastRpm = want;
+            }
+            return;
+        }
+
         if (remaining <= 0.0f)
         {
             /* Target reached. Brake and let it settle before declaring done -
@@ -288,10 +507,137 @@ void Motion_Tick(void)
     else /* MOTION_BRAKE */
     {
         s_brakeTicks++;
-        if (s_brakeTicks >= MOTION_BRAKE_TICKS)
+
+        /* Recentre the steering, but ONLY ONCE THE WHEELS HAVE STOPPED.
+         *
+         * This used to fire at the start of the brake phase, and that was
+         * wrong in a way that was easy to miss: the robot is still moving
+         * during braking - it coasts about 8 degrees of rotation before it
+         * settles - so a 60 us deflection held for 200 ms steers the robot
+         * through exactly that coast. Every stop nudged to one side.
+         *
+         * Waiting for both encoders to report no movement removes the
+         * guesswork. It also costs nothing on average, because the robot is
+         * usually stationary well before the brake settle ends. */
+        if (s_recentreStep == 0U)
         {
+            if ((Encoder_A_GetDelta() == 0) && (Encoder_B_GetDelta() == 0))
+            {
+                Servo_SetMicroseconds((uint16_t)(SERVO_CENTER_US - SERVO_APPROACH_US));
+                s_recentreStep = 1U;
+                s_recentreTick = 0U;
+            }
+        }
+        else if (s_recentreStep == 1U)
+        {
+            s_recentreTick++;
+            if (s_recentreTick >= 15U)          /* 150 ms to travel 60 us */
+            {
+                Servo_SetMicroseconds(SERVO_CENTER_US);
+                s_recentreStep = 2U;
+            }
+        }
+
+        /* Finish when the brake has settled AND the steering is centred.
+         * The second condition is capped by the tick count below so a wheel
+         * that never quite reads zero cannot hang the primitive. */
+        if ((s_brakeTicks >= MOTION_BRAKE_TICKS) &&
+            ((s_recentreStep == 2U) || (s_brakeTicks >= (MOTION_BRAKE_TICKS * 2U))))
+        {
+            Servo_SetMicroseconds(SERVO_CENTER_US);
             Motors_Coast();
-            s_state = MOTION_DONE;
+            s_recentreStep = 0U;
+
+#if MOTION_XCHECK_ENABLE
+            /* Second witness. The encoders measured how far the robot drove;
+             * the radius is a calibrated constant; so arc/radius is an angle
+             * that owes the gyro nothing. */
+            if (s_kind == MOVE_ARC)
+            {
+                s_xcheckDeg    = 0.0f;
+                s_xcheckErrPct = 0.0f;
+                s_xcheckFailed = 0U;
+
+                if (prof()->diff_boost <= MOTION_XCHECK_MAX_BOOST)
+                {
+                    float arc  = Odom_GetDistance() - s_arcStartDist;
+                    float gyro = Odom_GetHeadingTotal();
+
+                    if (gyro < 0.0f) { gyro = -gyro; }
+
+                    /* Below about 20 degrees the two agree to within their
+                     * own noise, so a comparison says nothing useful. */
+                    if ((arc > 1.0f) && (gyro > 20.0f) &&
+                        (prof()->radius_mm > 1.0f))
+                    {
+                        s_xcheckDeg = (arc / prof()->radius_mm)
+                                    * (180.0f / 3.14159265f);
+
+                        s_xcheckErrPct = ((s_xcheckDeg - gyro) / gyro) * 100.0f;
+
+                        {
+                            float m = s_xcheckErrPct;
+                            if (m < 0.0f) { m = -m; }
+                            s_xcheckFailed = (m > MOTION_XCHECK_TOL_PCT) ? 1U : 0U;
+                        }
+                    }
+                }
+            }
+#endif
+
+            /* Straight runs: fold this run's mean heading error into the
+             * steering centre trim. Once per move, after it has finished, so
+             * it cannot interfere with the loop while it is running. */
+            if (s_kind == MOVE_STRAIGHT)
+            {
+                Odom_LearnTrim();
+            }
+
+#if MOTION_ARC_ADAPTIVE_BRAKE
+            /* Learn. The coast just observed, against the rate we entered the
+             * brake at, gives this floor's deceleration directly. */
+            if (s_kind == MOVE_ARC)
+            {
+                float ended = Odom_GetHeadingTotal();
+                float coast;
+
+                if (ended < 0.0f) { ended = -ended; }
+                coast = ended - s_brakeAngle;
+
+                if ((coast > 0.5f) && (s_brakeRate > 5.0f))
+                {
+                    float meas = (s_brakeRate * s_brakeRate) / (2.0f * coast);
+
+                    /* Reject nonsense rather than believe it - a turn stopped
+                     * by hand, or a wheel slipping, would otherwise poison the
+                     * estimate for every run after it. */
+                    if ((meas > MOTION_ARC_DECEL_MIN) &&
+                        (meas < MOTION_ARC_DECEL_MAX))
+                    {
+                        s_arcDecel += MOTION_ARC_LEARN_GAIN
+                                    * (meas - s_arcDecel);
+                    }
+
+                    /* Whatever error survives alpha is latency. Positive
+                     * means overshoot, so the lag is bigger than believed
+                     * and the brakes need to go on sooner. Dividing by the
+                     * rate converts degrees of error into seconds of lag,
+                     * which is why this stays correct at other speeds. */
+                    {
+                        float want = (s_arcCommandDeg < 0)
+                                   ? (float)(-s_arcCommandDeg)
+                                   : (float)s_arcCommandDeg;
+                        float over = ended - want;
+
+                        s_arcLag += MOTION_ARC_LAG_GAIN * (over / s_brakeRate);
+
+                        if (s_arcLag < 0.0f)                { s_arcLag = 0.0f; }
+                        if (s_arcLag > MOTION_ARC_LAG_MAX_S) { s_arcLag = MOTION_ARC_LAG_MAX_S; }
+                    }
+                }
+            }
+#endif
+            s_state        = MOTION_DONE;
         }
     }
 }
@@ -325,4 +671,15 @@ int32_t Motion_GetRemaining(void)
 int32_t Motion_GetTravelled(void)
 {
     return (int32_t)Odom_GetDistance();
+}
+
+int32_t Motion_GetTurnedDeg(void)
+{
+    return (int32_t)Odom_GetHeadingTotal();
+}
+
+int32_t Motion_GetTurnTargetDeg(void)
+{
+    /* The COMMANDED angle, not the brake-compensated one. */
+    return (int32_t)s_arcCommandDeg;
 }
