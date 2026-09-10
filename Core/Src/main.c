@@ -467,8 +467,13 @@ static void Display(void)
         FmtCm(line, sizeof(line), "IRL", IR_LeftCm());       ShowLine(12, line);
         FmtCm(line, sizeof(line), "IRR", IR_RightCm());      ShowLine(24, line);
         FmtCm(line, sizeof(line), "US ", Ultrasonic_GetCm()); ShowLine(36, line);
-        snprintf(line, sizeof(line), "echoes %lu",
-                 (unsigned long)Ultrasonic_GetEchoCount());
+        /* rx is the UART re-arm count and belongs on a screen rather than in
+           the log, because it matters most while the RPi is driving - and by
+           then the console has gone quiet. Anything but 0 means the link is
+           glitching and being silently recovered. */
+        snprintf(line, sizeof(line), "ech%lu rx%lu",
+                 (unsigned long)Ultrasonic_GetEchoCount(),
+                 (unsigned long)RpiLink_GetRearmCount());
         ShowLine(48, line);
         break;
 
@@ -647,41 +652,41 @@ static void PrintDriveReport(void)
     fpart = (long)(err_x10 % 10);
     if (fpart < 0) { fpart = -fpart; }
 
-    RpiLink_Send("\r\n--- A.3 RUN ");
-    RpiLink_Send(g_repTimeout ? "TIMEOUT ---\r\n" : "DONE ---\r\n");
+    RpiLink_Log("\r\n--- A.3 RUN ");
+    RpiLink_Log(g_repTimeout ? "TIMEOUT ---\r\n" : "DONE ---\r\n");
 
     snprintf(line, sizeof(line), "commanded  %ld mm\r\n", (long)target);
-    RpiLink_Send(line);
+    RpiLink_Log(line);
     snprintf(line, sizeof(line), "odometry   %ld mm  (%ld.%ld %% off)\r\n",
              (long)measured, ipart, fpart);
-    RpiLink_Send(line);
+    RpiLink_Log(line);
 
     snprintf(line, sizeof(line), "counts     A %ld   B %ld\r\n",
              (long)g_repCntA, (long)g_repCntB);
-    RpiLink_Send(line);
+    RpiLink_Log(line);
     if (g_repCntA != 0)
     {
         snprintf(line, sizeof(line), "B/A        %ld.%ld %%  (100 = agree)\r\n",
                  (long)((g_repCntB * 1000) / g_repCntA) / 10,
                  (long)((g_repCntB * 1000) / g_repCntA) % 10);
-        RpiLink_Send(line);
+        RpiLink_Log(line);
     }
 
     snprintf(line, sizeof(line),
              "steer trim %+d us  -> add to SERVO_CENTER_US when settled\r\n",
              (int)Odom_GetHeadingTrim());
-    RpiLink_Send(line);
+    RpiLink_Log(line);
 
-    RpiLink_Send("Now TAPE MEASURE the real distance.\r\n");
-    RpiLink_Send("Two separate faults, two separate numbers:\r\n");
-    RpiLink_Send("  odometry vs TAPE  = wheel diameter\r\n");
-    RpiLink_Send("    WHEEL_DIAMETER_MM *= tape / odometry\r\n");
-    RpiLink_Send("  odometry vs COMMANDED = brake coast\r\n");
-    RpiLink_Send("    put the excess in MOTION_BRAKE_MM\r\n");
-    RpiLink_Send("Use odometry, not commanded, for the wheel -\r\n");
-    RpiLink_Send("odometry keeps counting through the coast, so\r\n");
-    RpiLink_Send("the tape/odometry ratio is coast-immune.\r\n");
-    RpiLink_Send("Five runs, average, then re-check.\r\n\r\n");
+    RpiLink_Log("Now TAPE MEASURE the real distance.\r\n");
+    RpiLink_Log("Two separate faults, two separate numbers:\r\n");
+    RpiLink_Log("  odometry vs TAPE  = wheel diameter\r\n");
+    RpiLink_Log("    WHEEL_DIAMETER_MM *= tape / odometry\r\n");
+    RpiLink_Log("  odometry vs COMMANDED = brake coast\r\n");
+    RpiLink_Log("    put the excess in MOTION_BRAKE_MM\r\n");
+    RpiLink_Log("Use odometry, not commanded, for the wheel -\r\n");
+    RpiLink_Log("odometry keeps counting through the coast, so\r\n");
+    RpiLink_Log("the tape/odometry ratio is coast-immune.\r\n");
+    RpiLink_Log("Five runs, average, then re-check.\r\n\r\n");
 }
 
 static void PrintTurnReport(void)
@@ -691,27 +696,27 @@ static void PrintTurnReport(void)
     {
         const ArcProfile_t *pr = Motion_GetArcProfileInfo(Motion_GetArcProfile());
         snprintf(line, sizeof(line), "\r\n[profile %s]  ", pr->name);
-        RpiLink_Send(line);
+        RpiLink_Log(line);
     }
-    RpiLink_Send("--- A.4 TURN ");
-    RpiLink_Send(g_repTimeout ? "TIMEOUT ---\r\n" : "DONE ---\r\n");
+    RpiLink_Log("--- A.4 TURN ");
+    RpiLink_Log(g_repTimeout ? "TIMEOUT ---\r\n" : "DONE ---\r\n");
 
     snprintf(line, sizeof(line), "commanded  %ld deg\r\n", (long)g_turnTarget);
-    RpiLink_Send(line);
+    RpiLink_Log(line);
     snprintf(line, sizeof(line), "gyro       %ld deg  (err %ld)\r\n",
              (long)g_turnGot, (long)(g_turnGot - g_turnTarget));
-    RpiLink_Send(line);
+    RpiLink_Log(line);
     {
         long mag = (g_turnGot < 0) ? -g_turnGot : g_turnGot;
         snprintf(line, sizeof(line), "arc length %ld mm   radius %ld mm\r\n",
                  (long)Motion_GetTravelled(),
                  (mag > 0) ? (long)(Motion_GetTravelled() * 57.2958f / (float)mag) : 0L);
-        RpiLink_Send(line);
+        RpiLink_Log(line);
     }
 
     snprintf(line, sizeof(line), "learned decel %d deg/s2, lag %d ms\r\n",
              (int)Motion_GetArcDecel(), (int)(Motion_GetArcLag() * 1000.0f));
-    RpiLink_Send(line);
+    RpiLink_Log(line);
 
     if (Motion_GetXCheckDeg() > 0.0f)
     {
@@ -720,13 +725,13 @@ static void PrintTurnReport(void)
                  (int)Motion_GetXCheckDeg(), (int)Motion_GetTurnedDeg(),
                  (int)Motion_GetXCheckErrPct(),
                  Motion_XCheckFailed() ? "*** DISAGREE ***" : "agree");
-        RpiLink_Send(line);
+        RpiLink_Log(line);
     }
     else
     {
-        RpiLink_Send("cross-check skipped - needs a profile with boost 1.0\r\n");
+        RpiLink_Log("cross-check skipped - needs a profile with boost 1.0\r\n");
     }
-    RpiLink_Send("Braking is adaptive - no constant to set.\r\n\r\n");
+    RpiLink_Log("Braking is adaptive - no constant to set.\r\n\r\n");
 }
 
 static void PrintSensors(void)
@@ -737,7 +742,7 @@ static void PrintSensors(void)
              (long)Encoder_A_GetCount(), (long)Encoder_B_GetCount(),
              (long)(Encoder_A_GetCount() / 10),
              (long)(Encoder_B_GetCount() / 10));
-    RpiLink_Send(line);
+    RpiLink_Log(line);
 
     /* Median first - that is the calibration number. Raw is alongside it as a
        liveness check: frozen raw means the ADC or the wiring, not the fit. */
@@ -745,19 +750,19 @@ static void PrintSensors(void)
              "IR med L %4u R %4u   (raw %4u %4u)\r\n",
              IR_LeftFiltered(), IR_RightFiltered(),
              IR_LeftRaw(), IR_RightRaw());
-    RpiLink_Send(line);
+    RpiLink_Log(line);
 
     snprintf(line, sizeof(line),
              "US echo %5u us  n=%lu\r\n",
              Ultrasonic_GetLastUs(),
              (unsigned long)Ultrasonic_GetEchoCount());
-    RpiLink_Send(line);
+    RpiLink_Log(line);
 
     snprintf(line, sizeof(line),
              "IR cm  L %5u R %5u   US %5u cm   (%u = no reading)\r\n",
              IR_LeftCm(), IR_RightCm(), Ultrasonic_GetCm(),
              (unsigned)SENSOR_NO_READING);
-    RpiLink_Send(line);
+    RpiLink_Log(line);
 }
 
 /* ==========================================================================
@@ -815,18 +820,18 @@ int main(void)
 
     if (IMU_Init(&hi2c2))
     {
-        RpiLink_Send("IMU ok\r\n");
+        RpiLink_Log("IMU ok\r\n");
     }
     else
     {
-        RpiLink_Send("IMU FAILED - check PB12 high, 1.8V rail\r\n");
+        RpiLink_Log("IMU FAILED - check PB12 high, 1.8V rail\r\n");
     }
     OLED_Clear();
 
-    RpiLink_Send("\r\n=== C30D FUNCTIONAL TEST BUILD ===\r\n");
-    RpiLink_Send("LONG press = mode, SHORT = action\r\n");
-    RpiLink_Send("1 DRIVE 2 SETDIST 3 TURN 4 SETANGLE\r\n");
-    RpiLink_Send("5 PROFILE 6 SERVO 7 SENSE 8 IRCAL 9 IMU\r\n\r\n");
+    RpiLink_Log("\r\n=== C30D FUNCTIONAL TEST BUILD ===\r\n");
+    RpiLink_Log("LONG press = mode, SHORT = action\r\n");
+    RpiLink_Log("1 DRIVE 2 SETDIST 3 TURN 4 SETANGLE\r\n");
+    RpiLink_Log("5 PROFILE 6 SERVO 7 SENSE 8 IRCAL 9 IMU\r\n\r\n");
 
     /* Tick LAST - nothing fires against an uninitialised module. */
     MX_TIM6_Init();
@@ -882,7 +887,7 @@ int main(void)
                 Motion_Stop();
                 Motion_ClearState();
                 Motors_Coast();
-                RpiLink_Send("STOP\r\n");
+                RpiLink_Log("STOP\r\n");
             }
             else if (g_mode == MODE_SETANGLE)
             {
@@ -902,7 +907,7 @@ int main(void)
                 g_lastWasTurn = 1U;
                 g_runStartA   = Encoder_A_GetCount();
                 g_runStartB   = Encoder_B_GetCount();
-                RpiLink_Send("\r\nA.4 turn starting\r\n");
+                RpiLink_Log("\r\nA.4 turn starting\r\n");
                 Motion_DriveArc(g_angleList[g_angleIdx], g_turnFwd, g_turnRight);
             }
             else if (g_mode == MODE_PROFILE)
@@ -913,7 +918,7 @@ int main(void)
                 Motion_SetArcProfile(n);
                 snprintf(msg, sizeof(msg), "arc profile -> %s\r\n",
                          Motion_GetArcProfileInfo(n)->name);
-                RpiLink_Send(msg);
+                RpiLink_Log(msg);
             }
             else if (g_mode == MODE_SERVO)
             {
@@ -932,13 +937,13 @@ int main(void)
                 snprintf(msg, sizeof(msg), "servo %u us (%+d)\r\n",
                          (unsigned)g_sweepUs,
                          (int)g_sweepUs - (int)SERVO_CENTER_US);
-                RpiLink_Send(msg);
+                RpiLink_Log(msg);
             }
             else if (g_mode == MODE_IMU)
             {
                 IMU_ResetHeading();
                 IMU_ResetStats();
-                RpiLink_Send("IMU heading + stats zeroed\r\n");
+                RpiLink_Log("IMU heading + stats zeroed\r\n");
             }
             else if (g_mode == MODE_SETDIST)
             {
@@ -956,7 +961,7 @@ int main(void)
                 g_runStartA   = Encoder_A_GetCount();
                 g_runStartB   = Encoder_B_GetCount();
 
-                RpiLink_Send("\r\nA.3 run starting\r\n");
+                RpiLink_Log("\r\nA.3 run starting\r\n");
                 Motion_DriveDistance(g_targetMm);
             }
             else
@@ -970,7 +975,7 @@ int main(void)
         {
             g_sweepHeld = 0U;
             Servo_SetRawUs(SERVO_CENTER_US);
-            RpiLink_Send("sweep timed out, centred\r\n");
+            RpiLink_Log("sweep timed out, centred\r\n");
         }
 
         if (now - tDisp >= 150u) { tDisp = now; Display(); }

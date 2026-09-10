@@ -48,9 +48,34 @@ void RpiLink_Poll(void);
 /* Call from HAL_UART_RxCpltCallback() when the instance is USART3. */
 void RpiLink_RxCallback(void);
 
-/* Plain text out on the same port, for telemetry and bring-up logging.
- * Safe to call from the main loop only. */
-void RpiLink_Send(const char *s);
+/* ---------------------------------------------------------------------------
+ * Plain text out on the same port, for telemetry and bring-up logging.
+ * Main loop only.
+ *
+ * THIS GOES SILENT ONCE THE RPi HAS SPOKEN, and that is deliberate.
+ *
+ * USART3 is both the bench console and the command link - there is only one
+ * port and the protocol owns it. While no host is connected the reports are
+ * the most useful diagnostic on the robot, so they run freely. The moment a
+ * valid command line parses off the wire, a real host is driving and anything
+ * else on this port lands in the middle of the OK/RESEND stream it is parsing.
+ * So the first parsed line latches the console off for good.
+ *
+ * Consequence worth knowing on the bench: connect the RPi and your terminal
+ * output stops. That is not a fault. Reset the board to get it back, with the
+ * host quiet.
+ *
+ * Protocol replies do NOT go through here - they use an internal path that is
+ * never gated, because a suppressed OK hangs the host forever. */
+void RpiLink_Log(const char *s);
+
+/* 1 once the console has latched off. */
+uint8_t RpiLink_IsQuiet(void);
+
+/* Times reception had to be re-armed after the HAL tore it down on a line
+ * error. Should be 0. Anything else means the link is glitching and being
+ * silently recovered - go and look at the wiring before it bites in a run. */
+uint32_t RpiLink_GetRearmCount(void);
 
 /* 1 while a line is being executed. For the OLED. */
 uint8_t RpiLink_IsBusy(void);

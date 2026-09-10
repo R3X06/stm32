@@ -20,6 +20,14 @@ static uint8_t     s_lineActive;   /* a line is in flight, owes a reply */
 static uint8_t     s_f0Active;     /* F0 running, poll the ultrasound   */
 static CmdOpcode_t s_lastOp = CMD_NONE;
 
+/* Set once a real command line has been parsed off the wire. From then on
+ * RpiLink_Log() is silent - see the note in rpilink.h. */
+static volatile uint8_t s_quiet;
+
+/* How many times reception had to be re-armed. See the watchdog in
+ * RpiLink_Poll(). Should stay at zero; anything else is line trouble. */
+static volatile uint32_t s_rearms;
+
 /* ===================================================================
  * Weak sensor stubs.
  *
@@ -56,12 +64,25 @@ __attribute__((weak)) uint8_t Sensors_HeadingValid(void)
 /* Transmit                                                            */
 /* ------------------------------------------------------------------ */
 
-void RpiLink_Send(const char *s)
+/* Unconditional. Protocol replies go out through this and are never gated -
+ * a suppressed OK would hang the RPi forever. */
+static void link_reply(const char *s)
 {
     if ((s_uart == 0) || (s == 0)) { return; }
 
     (void)HAL_UART_Transmit(s_uart, (uint8_t *)s, (uint16_t)strlen(s), 100U);
 }
+
+/* Human-readable telemetry. Silent once the RPi has spoken. */
+void RpiLink_Log(const char *s)
+{
+    if (s_quiet) { return; }
+
+    link_reply(s);
+}
+
+uint8_t  RpiLink_IsQuiet(void)      { return s_quiet; }
+uint32_t RpiLink_GetRearmCount(void) { return s_rearms; }
 
 /* ------------------------------------------------------------------ */
 /* Receive                                                             */
@@ -76,6 +97,8 @@ void RpiLink_Init(UART_HandleTypeDef *huart)
     s_lineActive = 0U;
     s_f0Active   = 0U;
     s_lastOp     = CMD_NONE;
+    s_quiet      = 0U;
+    s_rearms     = 0U;
 
     Cmd_Init();
 
@@ -201,11 +224,33 @@ void RpiLink_Poll(void)
     Command_t next;
     uint16_t  i;
 
+    /* ---- 0. re-arm reception if it has been torn down ----
+     *
+     * HAL_UART_IRQHandler() calls UART_EndRxTransfer() on an overrun, framing
+     * or noise error, which drops RxState back to READY and disables the RXNE
+     * interrupt. It then calls HAL_UART_ErrorCallback() - and this project
+     * does not define one, so the weak stub runs, nothing re-arms, and the
+     * link is deaf for the rest of the session. Motion still works, the OLED
+     * still updates, this function still runs; it simply never hears another
+     * command. One glitch on the line is all it takes.
+     *
+     * Checking the state here recovers from that, and also from a much
+     * narrower race where an RX interrupt lands inside HAL_UART_Transmit()'s
+     * locked section and the re-arm inside the callback returns HAL_BUSY.
+     *
+     * The counter is the point: silent recovery hides the underlying fault, so
+     * anything other than zero here means go and look at the wiring. */
+    if ((s_uart != 0) && (s_uart->RxState == HAL_UART_STATE_READY))
+    {
+        s_rearms++;
+        (void)HAL_UART_Receive_IT(s_uart, &s_rxByte, 1U);
+    }
+
     /* ---- 1. a dropped line still owes the sender an answer ---- */
     if (s_overrun)
     {
         s_overrun = 0U;
-        RpiLink_Send(CMD_REPLY_RESEND);
+        link_reply(CMD_REPLY_RESEND);
     }
 
     /* ---- 2. new line in ---- */
@@ -234,12 +279,17 @@ void RpiLink_Poll(void)
         }
         else if (Cmd_ParseLine(line))
         {
+            /* A line parsed off the wire means a real host is driving, so the
+             * console goes quiet from here. Anything else sharing this port
+             * would land in the middle of the OK/RESEND stream the host is
+             * parsing. One way only - it stays quiet until reset. */
+            s_quiet      = 1U;
             s_lineActive = 1U;
         }
         else
         {
             /* All-or-nothing: nothing was queued, so nothing to undo. */
-            RpiLink_Send(CMD_REPLY_RESEND);
+            link_reply(CMD_REPLY_RESEND);
         }
     }
 
@@ -270,7 +320,7 @@ void RpiLink_Poll(void)
         /* Whole line executed. One reply, now. */
         s_lineActive = 0U;
         s_f0Active   = 0U;
-        RpiLink_Send(CMD_REPLY_OK);
+        link_reply(CMD_REPLY_OK);
         return;
     }
 
