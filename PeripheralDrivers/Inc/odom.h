@@ -27,14 +27,119 @@
  * difference. On an Ackermann chassis that inference is weak - the rear
  * wheels barely differ on a gentle curve - so treat encoder heading as a
  * rough estimate until the IMU is available. */
-#define WHEEL_DIAMETER_MM   63.5f
+/* Effective rolling diameter of wheel A, mm. MEASURED - do not "correct"
+ * this back to a catalogue figure.
+ *
+ * The wheel is sold as 2.4 inch (60.96 mm). That is the RIM. The tread
+ * calipers at 65-66 mm, and four road tests agreed on 65.87 to 66.06 with
+ * the wheels averaged.
+ *
+ * 65.6 rather than 65.9 because the per-wheel counts below changed what the
+ * average means. Before, wheel B under-reported by 0.8%, so the averaged
+ * odometry read 0.9961 of wheel A and 65.9 was an averaged figure absorbing
+ * the mismatch. With B rescaled the average equals wheel A, so the diameter
+ * has to come down by the same 0.39% or the robot stops 4 mm short.
+ *
+ * If a run lands short after this change, put it back to 65.9. */
+#define WHEEL_DIAMETER_MM   65.9f
 #define WHEEL_BASE_MM       127.0f
 
 /* From the ten-revolution calibration. */
-#define ODOM_COUNTS_PER_REV 1560.0f
+/* Counts per wheel revolution, PER WHEEL. B is NOT 1560, and that is
+ * deliberate.
+ *
+ * Measured over four driven runs, wheel B counted 99.0, 99.2, 99.5 and 99.2
+ * percent of wheel A. Steady, not scattering - the signature of a fixed
+ * scale error rather than mechanical slip. (Slip was a real problem earlier
+ * and was cured by tightening the hub grub screw; it showed up as a 32%
+ * spread WITHIN a single run.)
+ *
+ * Why it matters far more than 0.8% sounds: odometry infers heading from
+ * (dA - dB) / track. A steady 0.8% shortfall on B is read as a continuous
+ * LEFTWARD yaw - about 3.5 degrees accumulated over a metre - and the
+ * heading loop obediently steers RIGHT to cancel a rotation that is not
+ * happening. That was the visible rightward drift.
+ *
+ * The control experiment: one run went visibly straight and STILL read
+ * 99.2%. A genuinely straight run must give 100%, so the mismatch causes
+ * the curve rather than resulting from it.
+ *
+ * 1560 x 0.9922 = 1548. Residual scatter is +-0.25%, which leaves about
+ * 1.1 degrees of phantom yaw instead of 3.5.
+ */
+#define ODOM_COUNTS_PER_REV_A  1560.0f
+/* Back to 1560, deliberately.
+ *
+ * 1548 was a correction for wheel B under-reporting by 0.8%, which odometry
+ * was reading as a phantom leftward yaw and the servo was counter-steering
+ * against. With heading now coming from the gyro, the encoder difference no
+ * longer steers anything, so that correction has nothing left to fix - and
+ * it WOULD disturb the distance calibration, which was measured at 0.0%
+ * error with both wheels at 1560 and the diameter at 65.9.
+ *
+ * Change one thing at a time. The proven distance setup stays. */
+#define ODOM_COUNTS_PER_REV_B  1560.0f
+
+/* Kept for anything still referencing the single-wheel name. */
+#define ODOM_COUNTS_PER_REV ODOM_COUNTS_PER_REV_A
 
 /* 63.5 * pi / 1560 -- about 0.128 mm of travel per count. */
-#define MM_PER_COUNT  ((WHEEL_DIAMETER_MM * 3.14159265f) / ODOM_COUNTS_PER_REV)
+#define MM_PER_COUNT_A ((WHEEL_DIAMETER_MM * 3.14159265f) / ODOM_COUNTS_PER_REV_A)
+#define MM_PER_COUNT_B ((WHEEL_DIAMETER_MM * 3.14159265f) / ODOM_COUNTS_PER_REV_B)
+#define MM_PER_COUNT   MM_PER_COUNT_A
+
+/* ---------------------------------------------------------------------------
+ * Which wheel measures how far the robot went.
+ *
+ *   ODOM_DIST_AVERAGE  mean of both. Correct when both encoders are trusted:
+ *                      the mean is the axle centre, which is what a distance
+ *                      command means. Use this once B is healthy.
+ *
+ *   ODOM_DIST_A_ONLY   wheel A alone. Use when B cannot be trusted. On a
+ *                      straight line A and the axle centre travel the same
+ *                      distance, so nothing is lost for A.3 - and one good
+ *                      encoder beats the average of a good one and a bad one,
+ *                      because averaging does not cancel B's error, it halves
+ *                      it and then hides it.
+ *
+ *   ODOM_DIST_B_ONLY   for swapping the test around.
+ *
+ * IN A TURN this matters: A is the left wheel, so on a right-hand arc it runs
+ * wide and A_ONLY over-reports the centre's travel by (R + track/2)/R. The
+ * arc primitives are not usable on A_ONLY without that correction.
+ * ------------------------------------------------------------------------- */
+#define ODOM_DIST_AVERAGE   0
+#define ODOM_DIST_A_ONLY    1
+#define ODOM_DIST_B_ONLY    2
+
+#define ODOM_DIST_SOURCE    ODOM_DIST_AVERAGE
+
+/* ---------------------------------------------------------------------------
+ * Where heading comes from.
+ *
+ *   ODOM_HEADING_ENCODER  from (dA - dB) / track. Works, but weak on an
+ *                         Ackermann chassis: the two rear wheels barely
+ *                         differ on a gentle curve, so it is a small angle
+ *                         inferred from the difference of two large numbers.
+ *                         Any per-wheel scale mismatch shows up as a
+ *                         constant phantom yaw. A measured 0.8% mismatch
+ *                         produced 3.5 degrees of phantom yaw per metre.
+ *
+ *   ODOM_HEADING_IMU      integrated gyro Z. Measures yaw directly, so wheel
+ *                         scale, slip and tyre scrub cannot corrupt it.
+ *                         Measured on this robot: 90 degrees by hand read
+ *                         90.5, and drift after zeroing is a fraction of a
+ *                         degree - against 3.5 degrees of encoder phantom
+ *                         yaw over the same run.
+ *
+ * The IMU setting falls back to the encoder automatically if IMU_IsReady()
+ * is false, so a failed sensor degrades to the old behaviour instead of
+ * leaving the robot with no heading at all.
+ * ------------------------------------------------------------------------- */
+#define ODOM_HEADING_ENCODER  0
+#define ODOM_HEADING_IMU      1
+
+#define ODOM_HEADING_SOURCE   ODOM_HEADING_IMU
 
 /* ---------------------------------------------------------------------------
  * Heading hold tuning
@@ -69,18 +174,39 @@
  * difference. */
 #define SERVO_BACKLASH_US   25.0f
 
-/* Sign convention. MUST BE VERIFIED ON THE ROBOT - see the procedure in the
- * comment above Odom_DriveHeading() in odom.c. Getting this backwards makes
- * the robot steer INTO the error and leave the line immediately.
+/* Sign convention: which way a positive heading error should steer.
  *
- * +1 or -1 only. */
-#define HEADING_SIGN        (+1)
+ * CHANGED FROM +1 TO -1 WHEN HEADING MOVED TO THE GYRO. The two heading
+ * sources count in OPPOSITE directions, and this is the constant that
+ * absorbs it:
+ *
+ *   Encoder:  d_theta = (dA - dB) / track, and Motor A is the LEFT rear.
+ *             On a left (counter-clockwise) turn the left wheel is on the
+ *             inside, so dA < dB and d_theta comes out NEGATIVE.
+ *             The encoder path is therefore CLOCKWISE-positive, whatever
+ *             the "CCW positive" comment on Odom_Pose_t says.
+ *
+ *   Gyro:     IMU_Z_SIGN +1 was verified on the robot by rotating it
+ *             anticlockwise and watching the heading INCREASE.
+ *             Counter-clockwise-positive.
+ *
+ * So switching source inverted the sign of every heading error, and a loop
+ * with the wrong sign steers INTO the error rather than out of it - which
+ * looks like the robot suddenly steering hard one way.
+ *
+ * If you ever switch ODOM_HEADING_SOURCE back to the encoder, flip this
+ * back to +1 at the same time.
+ *
+ * VERIFY, do not trust: start a straight run, let it settle, nudge the nose
+ * a few degrees by hand. The front wheels must turn to steer BACK toward the
+ * original line. If they turn the same way you nudged, flip this. */
+#define HEADING_SIGN        (-1)
 
 typedef struct
 {
     float x_mm;         /* forward from the start pose   */
     float y_mm;         /* left of the start pose        */
-    float heading_deg;  /* CCW positive, wraps to +-180  */
+    float heading_deg;  /* sign follows ODOM_HEADING_SOURCE; wraps to +-180 */
     float distance_mm;  /* total path length travelled   */
 } Odom_Pose_t;
 
@@ -111,6 +237,43 @@ void Odom_DriveStraight(int16_t rpm);
 
 /* Drive at the given speed holding a specific heading in degrees. */
 void Odom_DriveHeading(int16_t rpm, float heading_deg);
+
+/* Change speed WITHOUT disturbing the active drive mode.
+ *
+ * Odom_DriveHeading() latches a new heading target, zeroes the accumulated
+ * error and recentres the servo. That is right when a move starts and wrong
+ * in the middle of one: calling it to slow down for the approach throws away
+ * the correction the loop had settled on and snaps the steering to centre,
+ * which shows up as a visible twitch in the last 150 mm of the run - exactly
+ * the part the supervisor is watching for A.3.
+ *
+ * This changes only the setpoint. For an arc the inner/outer split is
+ * recomputed at the new speed and the servo is left where it is. */
+void Odom_SetSpeed(int16_t rpm);
+
+/* ------------------------------------------------------------------ */
+/* Arc driving                                                         */
+/* ------------------------------------------------------------------ */
+
+/* Hold a fixed steering deflection and drive an arc.
+ *
+ * Heading hold is OFF for the duration - on an Ackermann chassis the heading
+ * is set by the steering angle, and a heading loop fighting a deliberate turn
+ * just cancels it.
+ *
+ * The two rear wheels are commanded at DIFFERENT speeds. There is no
+ * mechanical differential here; both rear wheels are driven independently, so
+ * if they are told to run at the same RPM through a turn the inner one is
+ * dragged and both tyres scrub. Speeds are split from the geometry:
+ *
+ *     v_outer / v_inner = (R + track/2) / (R - track/2)
+ *
+ * radius_mm is measured at the CENTRE of the rear axle, which is also what
+ * Odom_GetDistance() reports, so arc length = radius * angle.
+ *
+ * right: 1 to curve right (Motor B inner), 0 to curve left (Motor A inner).
+ * Negative rpm reverses. */
+void Odom_DriveArc(int16_t rpm, uint16_t servo_us, float radius_mm, uint8_t right);
 
 /* Stops the robot, recentres the steering, disables heading hold. */
 void Odom_Stop(void);

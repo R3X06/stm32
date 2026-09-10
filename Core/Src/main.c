@@ -2,577 +2,480 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : MOTION + DISTANCE CALIBRATION BUILD  (C30D V2.1 / F407VET6)
+  * @brief          : FUNCTIONAL TEST BUILD  (C30D V2.1 / F407VET6)
   *
-  *  Self-contained. Depends only on main.h, oled.h and the CubeMX-generated
-  *  stm32f4xx_hal_msp.c / stm32f4xx_it.c already in the repo. No motors.c,
-  *  encoders.c, odom.c, pid.c or calib.c required.
+  *  MDP Group 15. Ackermann chassis: two driven rear wheels, one steering
+  *  servo on the front axle. The robot cannot turn on the spot.
   *
-  *  Four modes, cycled with a LONG press on the user button (PE0).
-  *  SHORT press performs that mode's action. Any press while running aborts.
+  *  PURPOSE OF THIS BUILD
+  *  Prove checklist A.3 (straight line, 80-120 cm, +/-6%, no visible
+  *  deviation) and prove the IR and ultrasonic sensors read distance
+  *  correctly - both WITHOUT the Raspberry Pi.
   *
-  *    M1 ENC   motors coast. Raw signed encoder totals. Push the robot or
-  *             spin a wheel by hand to find ENC_*_INVERT and counts/rev.
-  *             SHORT = zero the totals.
-  *    M2 DUTY  open loop, both wheels at OPEN_LOOP_DUTY_PCT. Confirms motor
-  *             direction and gives a feel for deadband.  SHORT = start/stop.
-  *    M3 RPM   closed-loop speed hold at RPM_SET. Confirms the PID.
-  *             SHORT = start/stop.
-  *    M4 DIST  drives DIST_TARGET_CM closed loop with an end taper, then
-  *             reports counts over USART3.  SHORT = start/abort.
+  *  Everything is driven through the same PeripheralDrivers the RPi command
+  *  layer will call later, so the numbers measured here carry straight over.
+  *  Nothing calibrated in this build has to be redone after RPi integration.
   *
-  *  Telemetry on USART3 (PD8/PD9) 115200 8N1 — open it in PuTTY and the
-  *  whole calibration session is logged for you.
+  *  MODES - LONG press the user button (PE0) to cycle, SHORT press to act.
+  *  A long press also aborts whatever is moving.
   *
-  *  SAFETY: M2/M3 spin the wheels the moment you short-press. Put the car on
-  *  a stand for those two. Only M4 is a floor test.
+  *    1 DRIVE    A.3 run. SHORT drives the selected distance and holds the
+  *               result on screen: target, odometry, error %, and B/A
+  *               encoder agreement for that run.
+  *    2 SETDIST  SHORT steps the target 800..1200 mm in 100 mm steps.
+  *    3 SENSE    Live calibrated distances from both IRs and the ultrasonic,
+  *               plus the echo counter. SHORT streams a sample to USART3.
+  *    4 IRCAL    Raw filtered ADC counts, for filling in the IR lookup table
+  *               in ir.c. SHORT streams a sample to USART3.
+  *
+  *  CONTROL TICK - TIM6, 100 Hz, priority 6. Order is not negotiable:
+  *      Encoders_Update() -> Motion_Tick() -> Odom_Update() -> PID_Update()
+  *
+  *  The sensors are cheap by construction, so they ride in the tick without
+  *  disturbing it: IR_Update() only reads a buffer the DMA has already
+  *  filled, and Ultrasonic_Tick() does nothing on five ticks out of six. The
+  *  only busy-wait anywhere is the 11 us trigger pulse, once every 60 ms.
+  *  See ir.h and ultrasonic.h.
+  *
+  *  SAFETY: motor PWM is brought up and pinned at zero before anything else
+  *  can touch it. Floating AT8236 inputs are a confirmed runaway mode on this
+  *  board.
   ******************************************************************************
   */
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "motors.h"
+#include "encoders.h"
+#include "pid.h"
+#include "odom.h"
+#include "motion.h"
+#include "ir.h"
+#include "ultrasonic.h"
+#include "imu.h"
+#include "commands.h"
+#include "rpilink.h"
 #include "oled.h"
 #include <stdio.h>
-#include <stdarg.h>
-#include <string.h>
-#include <stdlib.h>
 
-/* ==========================================================================
- *  CALIBRATION CONSTANTS   <<<<<< THIS IS THE BLOCK YOU EDIT >>>>>>
- * ========================================================================== */
+/* Private define ------------------------------------------------------------*/
 
-/* Encoder counts for one full output-shaft revolution.
-   1320 = JGB37-520: 11 PPR x 30:1 gearbox x 4 edges. PROVISIONAL.
-   Measure it in M1 before you trust anything downstream.                    */
-#define TICKS_PER_REV        1320.0f
+/* Distance the DRIVE mode commands, mm. A.3 asks for a supervisor-specified
+   distance between 800 and 1200. 1000 is the middle of that band. */
+#define DIST_TARGET_MM       1000
 
-/* Encoder counts per centimetre of ground travel. PROVISIONAL, assumes a
-   65 mm wheel: 1320 / (pi * 6.5) = 64.6. This is the number the whole
-   calibration exists to determine. Update it after every M4 run:
-
-       NEW = OLD * (commanded_cm / tape_measured_cm)                         */
-#define COUNTS_PER_CM        64.6f
-
-/* Distance M4 drives, in centimetres. Checklist A.3 wants 80-120 cm.        */
-#define DIST_TARGET_CM       100.0f
-
-/* Set to 1 if that wheel counts DOWN when the robot is pushed forward.
-   Determine in M1: push the car forward by hand, both totals must rise.     */
-#define ENC_A_INVERT         0
-#define ENC_B_INVERT         1
-
-/* Set to 1 if that wheel spins BACKWARD on a positive duty.
-   Determine in M2: on a stand, both wheels must turn forward.               */
-#define MOTOR_A_INVERT       0
-#define MOTOR_B_INVERT       0
-
-/* Steering servo, TIM12_CH2 @ 1 us/count. Centre from your servo calib.     */
-#define SERVO_CENTER_US      1500
-
-/* Speed setpoints */
-#define RPM_SET              60.0f    /* cruise target, output shaft RPM     */
-#define RPM_MIN              20.0f    /* floor during the end taper          */
-#define TAPER_CM             15.0f    /* start slowing this far from target  */
-#define RPM_SLEW_PER_TICK    3.0f     /* target ramp, RPM per 10 ms tick     */
-
-/* Open-loop duty for M2, percent */
-#define OPEN_LOOP_DUTY_PCT   50
-
-/* Speed PID, operating in counts-per-tick.
-   At 60 RPM: 1320 * 60/60 / 100 ticks-per-sec = 13.2 counts/tick.           */
-#define KP                   80.0f
-#define KI                   400.0f
-#define KD                   0.0f
-#define KFF                  55.0f    /* feedforward duty per count/tick     */
-
-/* Abort a move that has not finished in this many ms */
-#define MOVE_TIMEOUT_MS      15000u
-
-/* ==========================================================================
- *  Derived / fixed
- * ========================================================================== */
-
-#define PWM_MAX              4199     /* TIM4 and TIM9 ARR, both = 4199      */
-#define TICK_MS              10
-#define DT_S                 0.01f
-#define TICKS_PER_SEC        100.0f
 #define BTN_LONG_TICKS       60       /* 600 ms */
-#define BRAKE_TICKS          40       /* 400 ms settle after stopping        */
+#define BTN_DEBOUNCE_TICKS   3        /* 30 ms  */
 
-/* counts/tick  ->  output-shaft RPM */
-#define CPT_TO_RPM           ((TICKS_PER_SEC * 60.0f) / TICKS_PER_REV)
+/* Selectable range for the A.3 run. The checklist says the supervisor names
+   a distance between 80 and 120 cm on the day, so the whole band has to be
+   reachable from the button without a rebuild. */
+#define DIST_MIN_MM          800
+#define DIST_MAX_MM          1200
+#define DIST_STEP_MM         100
+
+typedef enum { MODE_DRIVE = 0, MODE_SETDIST, MODE_SENSE, MODE_IRCAL,
+               MODE_IMU, MODE_COUNT } uimode_t;
 
 /* Private variables ---------------------------------------------------------*/
-TIM_HandleTypeDef htim2;    /* encoder A  PA15 / PB3   */
-TIM_HandleTypeDef htim3;    /* encoder B  PB4  / PB5   */
-TIM_HandleTypeDef htim4;    /* motor A    PB9=CH4 PB8=CH3 */
-TIM_HandleTypeDef htim6;    /* 10 ms control tick      */
-TIM_HandleTypeDef htim9;    /* motor B    PE5=CH1 PE6=CH2 */
-TIM_HandleTypeDef htim12;   /* servo      PB15         */
-UART_HandleTypeDef huart3;  /* PD8 / PD9               */
+TIM_HandleTypeDef  htim2;    /* encoder A  PA15 / PB3      */
+TIM_HandleTypeDef  htim3;    /* encoder B  PB4  / PB5      */
+TIM_HandleTypeDef  htim4;    /* motor A    PB8=CH3 PB9=CH4 */
+TIM_HandleTypeDef  htim6;    /* 10 ms control tick         */
+TIM_HandleTypeDef  htim8;    /* US echo capture PC7 = CH2  */
+TIM_HandleTypeDef  htim9;    /* motor B    PE5=CH1 PE6=CH2 */
+TIM_HandleTypeDef  htim12;   /* servo      PB15 = CH2      */
+UART_HandleTypeDef huart3;   /* PD8 / PD9                  */
+ADC_HandleTypeDef  hadc1;    /* IR L PC0, IR R PC1         */
+I2C_HandleTypeDef  hi2c2;    /* ICM-20948  PB10/PB11       */
+DMA_HandleTypeDef  hdma_adc1;
 
-/* Never initialised. They exist only so stm32f4xx_it.c links. The TIM8 and
-   DMA2_Stream0 interrupts are never enabled, so their handlers never run. */
-TIM_HandleTypeDef htim8;
-DMA_HandleTypeDef hdma_adc1;
+static volatile uint8_t  g_evtShort = 0, g_evtLong = 0;
+static volatile uimode_t g_mode = MODE_DRIVE;
 
-typedef enum { M_ENC = 0, M_DUTY, M_RPM, M_DIST, M_COUNT } calmode_t;
-typedef enum { R_IDLE = 0, R_RUN, R_BRAKE } runstate_t;
+/* Commanded distance for the next run. Changed in MODE_SETDIST. */
+static volatile int32_t  g_targetMm = DIST_TARGET_MM;
 
-typedef struct { float integ; float prev_err; } pidctl_t;
-
-static volatile calmode_t     g_mode  = M_ENC;
-static volatile runstate_t g_state = R_IDLE;
-
-static volatile int32_t g_totA = 0, g_totB = 0;   /* signed, sign-corrected  */
-static volatile int16_t g_dA = 0,   g_dB = 0;     /* counts this tick        */
-static uint16_t s_lastA = 0, s_lastB = 0;
-static uint8_t  s_encPrimed = 0;
-
-static volatile float g_rpmA = 0.0f, g_rpmB = 0.0f;   /* filtered, display   */
-static float  s_rpmCmd = 0.0f;                        /* slewed setpoint     */
-static pidctl_t  s_pidA, s_pidB;
-
-static int32_t  s_targetCounts = 0;
-static uint32_t s_runTicks = 0;
-static uint16_t s_brakeTicks = 0;
-
-/* Result of the last M4 run, latched for the main loop to print */
+/* Latched at the end of a DRIVE run so the main loop can print it, and so
+   the display can hold the result instead of reverting to a live readout
+   the moment the state machine goes back to IDLE. */
 static volatile uint8_t  g_reportReady = 0;
-static volatile int32_t  g_repA = 0, g_repB = 0, g_repAvg = 0, g_repTarget = 0;
-static volatile uint32_t g_repMs = 0;
-static volatile uint8_t  g_repTimeout = 0;
+static volatile int32_t  g_repMm = 0;
+static volatile int32_t  g_repTarget = 0;
+static volatile int32_t  g_repCntA = 0;
+static volatile int32_t  g_repCntB = 0;
 
-/* Button events, produced in the tick, consumed in the tick */
-static volatile uint8_t g_evtShort = 0, g_evtLong = 0;
+/* Encoder counts at the MOMENT THE RUN STARTS.
+   Encoder_x_GetCount() accumulates since boot and nothing resets it during
+   normal operation, so subtracting these is the only way to get counts for
+   THIS run. Without them B/A becomes a lifetime average that quietly stops
+   showing run-to-run scatter - which is the whole thing we are looking for. */
+static volatile int32_t  g_runStartA = 0;
+static volatile int32_t  g_runStartB = 0;
+static volatile uint8_t  g_repTimeout = 0;
+static volatile uint8_t  g_repValid = 0;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM6_Init(void);
+static void MX_TIM8_Init(void);
 static void MX_TIM9_Init(void);
 static void MX_TIM12_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_I2C2_Init(void);
 
-static void MotorA_Set(int32_t duty);
-static void MotorB_Set(int32_t duty);
-static void Motors_Coast(void);
-static void Motors_Brake(void);
-static void Servo_Set(uint16_t us);
-static void Enc_Zero(void);
-static void Enc_Update(void);
-static float Pid_Step(pidctl_t *p, float target_cpt, float meas_cpt);
-static void Control_Tick(void);
 static void Btn_Poll(void);
 static void Display(void);
-static void U3(const char *fmt, ...);
-static void PrintFixed2(const char *label, int32_t val_x100, const char *unit);
 
 /* ==========================================================================
- *  Motors — AT8236, PWM/PWM fast decay. Both inputs low = coast.
- *  Motor A: PB9 (Ain1) = TIM4_CH4 forward,  PB8 (Ain2) = TIM4_CH3 reverse
- *  Motor B: PE5 (Bin1) = TIM9_CH1 forward,  PE6 (Bin2) = TIM9_CH2 reverse
- * ========================================================================== */
-
-static void MotorA_Set(int32_t duty)
-{
-#if MOTOR_A_INVERT
-    duty = -duty;
-#endif
-    if (duty >  PWM_MAX) duty =  PWM_MAX;
-    if (duty < -PWM_MAX) duty = -PWM_MAX;
-
-    if (duty >= 0) {
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0);
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, (uint32_t)duty);
-    } else {
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, 0);
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, (uint32_t)(-duty));
-    }
-}
-
-static void MotorB_Set(int32_t duty)
-{
-#if MOTOR_B_INVERT
-    duty = -duty;
-#endif
-    if (duty >  PWM_MAX) duty =  PWM_MAX;
-    if (duty < -PWM_MAX) duty = -PWM_MAX;
-
-    if (duty >= 0) {
-        __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_2, 0);
-        __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_1, (uint32_t)duty);
-    } else {
-        __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_1, 0);
-        __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_2, (uint32_t)(-duty));
-    }
-}
-
-static void Motors_Coast(void)
-{
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0);
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, 0);
-    __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_1, 0);
-    __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_2, 0);
-}
-
-/* Both inputs high = brake. Stops the coast-on that would otherwise smear
-   the distance measurement. */
-static void Motors_Brake(void)
-{
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, PWM_MAX + 1);
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, PWM_MAX + 1);
-    __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_1, PWM_MAX + 1);
-    __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_2, PWM_MAX + 1);
-}
-
-static void Servo_Set(uint16_t us)
-{
-    if (us < 1000u) us = 1000u;
-    if (us > 2000u) us = 2000u;
-    __HAL_TIM_SET_COMPARE(&htim12, TIM_CHANNEL_2, us);
-}
-
-/* ==========================================================================
- *  Encoders — wrap-safe signed deltas. TIM2 ARR is forced to 65535 so both
- *  timers can be treated as 16-bit and the same (int16_t) cast works.
- * ========================================================================== */
-
-static void Enc_Zero(void)
-{
-    __disable_irq();
-    s_lastA = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
-    s_lastB = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
-    g_totA = 0; g_totB = 0;
-    g_dA = 0;   g_dB = 0;
-    g_rpmA = 0.0f; g_rpmB = 0.0f;
-    s_encPrimed = 1;
-    __enable_irq();
-}
-
-static void Enc_Update(void)
-{
-    uint16_t nA = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
-    uint16_t nB = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
-    int16_t  dA, dB;
-
-    if (!s_encPrimed) { s_lastA = nA; s_lastB = nB; s_encPrimed = 1; return; }
-
-    dA = (int16_t)(nA - s_lastA);
-    dB = (int16_t)(nB - s_lastB);
-    s_lastA = nA;
-    s_lastB = nB;
-
-#if ENC_A_INVERT
-    dA = (int16_t)(-dA);
-#endif
-#if ENC_B_INVERT
-    dB = (int16_t)(-dB);
-#endif
-
-    g_dA = dA;
-    g_dB = dB;
-    g_totA += dA;
-    g_totB += dB;
-
-    /* light EMA so the display is readable */
-    g_rpmA += 0.25f * (((float)dA * CPT_TO_RPM) - g_rpmA);
-    g_rpmB += 0.25f * (((float)dB * CPT_TO_RPM) - g_rpmB);
-}
-
-/* ==========================================================================
- *  Speed PID, in counts-per-tick
- * ========================================================================== */
-
-static float Pid_Step(pidctl_t *p, float target_cpt, float meas_cpt)
-{
-    float err = target_cpt - meas_cpt;
-    float out, d;
-
-    p->integ += err * DT_S;
-    if (KI > 0.0f) {                       /* clamp the I contribution */
-        float lim = (float)PWM_MAX / KI;
-        if (p->integ >  lim) p->integ =  lim;
-        if (p->integ < -lim) p->integ = -lim;
-    }
-
-    d = (err - p->prev_err) / DT_S;
-    p->prev_err = err;
-
-    out = (KFF * target_cpt) + (KP * err) + (KI * p->integ) + (KD * d);
-
-    if (out >  (float)PWM_MAX) out =  (float)PWM_MAX;
-    if (out < -(float)PWM_MAX) out = -(float)PWM_MAX;
-    return out;
-}
-
-static void Pid_Reset(void)
-{
-    s_pidA.integ = 0.0f; s_pidA.prev_err = 0.0f;
-    s_pidB.integ = 0.0f; s_pidB.prev_err = 0.0f;
-    s_rpmCmd = 0.0f;
-}
-
-/* ==========================================================================
- *  Button, PE0, active low, external 10k pull-up
+ *  Button. Polled from the control tick so the timing is exact.
  * ========================================================================== */
 
 static void Btn_Poll(void)
 {
-    static uint8_t  stable = 1, cnt = 0;
-    static uint16_t held = 0;
-    static uint8_t  longFired = 0;
+    static uint8_t  down  = 0;
+    static uint16_t held  = 0;
+    static uint8_t  fired = 0;
 
-    uint8_t raw = (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_0) == GPIO_PIN_SET) ? 1u : 0u;
+    uint8_t now = (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_0) == GPIO_PIN_RESET) ? 1U : 0U;
 
-    if (raw != stable) {
-        if (++cnt >= 3) { stable = raw; cnt = 0; }
-    } else {
-        cnt = 0;
+    if (now)
+    {
+        if (held < 0xFFFFU) { held++; }
+        if (!down && (held >= BTN_DEBOUNCE_TICKS)) { down = 1U; }
+
+        /* Fire on crossing the threshold, not on release, so holding the
+           button is an immediate stop. */
+        if (down && !fired && (held >= BTN_LONG_TICKS))
+        {
+            g_evtLong = 1U;
+            fired     = 1U;
+        }
     }
-
-    if (stable == 0u) {                    /* pressed */
-        if (held < 60000u) held++;
-        if (!longFired && held >= BTN_LONG_TICKS) { g_evtLong = 1; longFired = 1; }
-    } else {                               /* released */
-        if (held > 0u && !longFired) g_evtShort = 1;
-        held = 0;
-        longFired = 0;
+    else
+    {
+        if (down && !fired) { g_evtShort = 1U; }
+        down = 0U; held = 0U; fired = 0U;
     }
 }
 
 /* ==========================================================================
- *  10 ms control tick — called from TIM6
+ *  Control tick. Short, non-blocking. No HAL_Delay, no UART, no OLED, and
+ *  no sensor polling - the ultrasonic trigger lives in the main loop.
  * ========================================================================== */
-
-static void Start_Run(void)
-{
-    Pid_Reset();
-    Enc_Zero();
-    Servo_Set(SERVO_CENTER_US);
-    s_runTicks = 0;
-    s_targetCounts = (int32_t)(DIST_TARGET_CM * COUNTS_PER_CM);
-    g_state = R_RUN;
-}
-
-static void Stop_Run(uint8_t timedOut)
-{
-    Motors_Brake();
-    g_repA       = g_totA;
-    g_repB       = g_totB;
-    g_repTarget  = s_targetCounts;
-    g_repMs      = s_runTicks * TICK_MS;
-    g_repTimeout = timedOut;
-    s_brakeTicks = 0;
-    g_state = R_BRAKE;
-}
-
-static void Control_Tick(void)
-{
-    Enc_Update();
-    Btn_Poll();
-
-    /* ---- button events ---- */
-    if (g_evtLong) {
-        g_evtLong = 0;
-        if (g_state != R_IDLE) {
-            Stop_Run(0);
-        } else {
-            g_mode = (calmode_t)((g_mode + 1) % M_COUNT);
-            Motors_Coast();
-            Enc_Zero();
-        }
-    }
-    if (g_evtShort) {
-        g_evtShort = 0;
-        if (g_state != R_IDLE) {
-            Stop_Run(0);
-        } else {
-            switch (g_mode) {
-            case M_ENC:
-                Enc_Zero();
-                break;
-            case M_DUTY:
-            case M_RPM:
-                Pid_Reset();
-                Enc_Zero();
-                Servo_Set(SERVO_CENTER_US);
-                s_runTicks = 0;
-                s_targetCounts = 0;
-                g_state = R_RUN;
-                break;
-            case M_DIST:
-                Start_Run();
-                break;
-            default:
-                break;
-            }
-        }
-    }
-
-    /* ---- brake settle ---- */
-    if (g_state == R_BRAKE) {
-        if (++s_brakeTicks >= BRAKE_TICKS) {
-            Motors_Coast();
-            /* counts AFTER the wheels have actually stopped — this is the
-               figure that matches the tape measure */
-            g_repAvg = (g_totA + g_totB) / 2;
-            g_repA   = g_totA;
-            g_repB   = g_totB;
-            g_reportReady = 1;
-            g_state = R_IDLE;
-        }
-        return;
-    }
-
-    if (g_state == R_IDLE) { Motors_Coast(); return; }
-
-    /* ---- running ---- */
-    s_runTicks++;
-    if ((s_runTicks * TICK_MS) > MOVE_TIMEOUT_MS) { Stop_Run(1); return; }
-
-    if (g_mode == M_DUTY) {
-        int32_t duty = (PWM_MAX * OPEN_LOOP_DUTY_PCT) / 100;
-        MotorA_Set(duty);
-        MotorB_Set(duty);
-        return;
-    }
-
-    /* M_RPM and M_DIST both run the speed PID */
-    {
-        float rpmWanted = RPM_SET;
-        float tgt_cpt, outA, outB;
-
-        if (g_mode == M_DIST) {
-            int32_t travelled = (g_totA + g_totB) / 2;
-            int32_t remaining = s_targetCounts - travelled;
-            int32_t taper     = (int32_t)(TAPER_CM * COUNTS_PER_CM);
-
-            if (remaining <= 0) { Stop_Run(0); return; }
-
-            if (taper > 0 && remaining < taper) {
-                rpmWanted = RPM_MIN +
-                    (RPM_SET - RPM_MIN) * ((float)remaining / (float)taper);
-                if (rpmWanted < RPM_MIN) rpmWanted = RPM_MIN;
-            }
-        }
-
-        /* slew the setpoint so we do not break traction on launch */
-        if (s_rpmCmd < rpmWanted) {
-            s_rpmCmd += RPM_SLEW_PER_TICK;
-            if (s_rpmCmd > rpmWanted) s_rpmCmd = rpmWanted;
-        } else if (s_rpmCmd > rpmWanted) {
-            s_rpmCmd -= RPM_SLEW_PER_TICK;
-            if (s_rpmCmd < rpmWanted) s_rpmCmd = rpmWanted;
-        }
-
-        tgt_cpt = s_rpmCmd / CPT_TO_RPM;
-
-        outA = Pid_Step(&s_pidA, tgt_cpt, (float)g_dA);
-        outB = Pid_Step(&s_pidB, tgt_cpt, (float)g_dB);
-
-        MotorA_Set((int32_t)outA);
-        MotorB_Set((int32_t)outB);
-    }
-}
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM6) {
-        Control_Tick();
+    if (htim->Instance == TIM6)
+    {
+        /* Sensors first, then control. IMU_Tick() integrates the sample
+           IMU_Poll() fetched from the main loop, and Odom_Update() now reads
+           that heading - so it has to run BEFORE Odom, or the heading loop
+           acts on a value one tick stale.
+
+           All three are cheap: IR_Update() reads a buffer the DMA already
+           filled, Ultrasonic_Tick() does nothing on five ticks out of six,
+           and IMU_Tick() is one multiply-accumulate. No I2C here - that is
+           in IMU_Poll(), out in the main loop. */
+        Encoders_Update();
+        IR_Update();
+        Ultrasonic_Tick();
+        IMU_Tick();
+
+        Motion_Tick();
+        Odom_Update();
+        PID_Update();
+
+        Btn_Poll();
+
+        /* Latch the result of a finished run for the main loop to print. */
+        if (!g_reportReady)
+        {
+            MotionState_t st = Motion_GetState();
+
+            if ((st == MOTION_DONE) || (st == MOTION_TIMEOUT))
+            {
+                g_repMm       = (int32_t)Odom_GetDistance();
+                g_repCntA     = Encoder_A_GetCount() - g_runStartA;
+                g_repCntB     = Encoder_B_GetCount() - g_runStartB;
+                g_repTimeout  = (st == MOTION_TIMEOUT) ? 1U : 0U;
+                g_reportReady = 1U;
+                g_repValid    = 1U;
+            }
+        }
+    }
+}
+
+/* HC-SR04 echo, both edges, TIM8_CH2 on PC7. */
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    Ultrasonic_CaptureCallback(htim);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART3)
+    {
+        RpiLink_RxCallback();
     }
 }
 
 /* ==========================================================================
- *  USART3 helpers.  No %f anywhere — newlib-nano will not print floats
- *  unless you link the float printf, so everything is scaled integers.
- * ========================================================================== */
-
-static void U3(const char *fmt, ...)
-{
-    char buf[96];
-    va_list ap;
-    int n;
-
-    va_start(ap, fmt);
-    n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-
-    if (n > 0) {
-        if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
-        HAL_UART_Transmit(&huart3, (uint8_t *)buf, (uint16_t)n, 200);
-    }
-}
-
-static void PrintFixed2(const char *label, int32_t val_x100, const char *unit)
-{
-    int32_t whole = val_x100 / 100;
-    int32_t frac  = val_x100 % 100;
-    if (frac < 0) frac = -frac;
-    U3("%s%ld.%02ld%s\r\n", label, (long)whole, (long)frac, unit);
-}
-
-/* ==========================================================================
- *  OLED — 16 chars per line, 4 lines. Lines are padded so old text clears.
+ *  Display
  * ========================================================================== */
 
 static void ShowLine(uint8_t y, const char *s)
 {
     char pad[17];
     int i = 0;
-    while (s[i] != '\0' && i < 16) { pad[i] = s[i]; i++; }
+    while ((s[i] != '\0') && (i < 16)) { pad[i] = s[i]; i++; }
     while (i < 16) { pad[i++] = ' '; }
     pad[16] = '\0';
     OLED_ShowString(0, y, (const uint8_t *)pad);
 }
 
+/* Prints a distance, or four dashes when the sensor has nothing to say.
+   Never print a number for a missing reading - a stale value that looks
+   real is worse than an obvious gap. */
+static void FmtCm(char *buf, int n, const char *label, uint16_t cm)
+{
+    if (cm == SENSOR_NO_READING) { snprintf(buf, n, "%s ---", label); }
+    else                         { snprintf(buf, n, "%s %3u cm", label, cm); }
+}
+
 static void Display(void)
 {
-    static const char *names[M_COUNT] = { "ENC ", "DUTY", "RPM ", "DIST" };
-    char l[24];
-    int32_t tA = g_totA, tB = g_totB;
+    static const char *st[] = { "IDLE", "ALGN", "RUN ", "BRK ", "DONE", "TMO " };
+    char    line[40];
+    int32_t h10;
+    long    whole, frac;
 
-    snprintf(l, sizeof(l), "M%d %s %s", (int)g_mode + 1, names[g_mode],
-             (g_state == R_IDLE) ? "---" : "RUN");
-    ShowLine(0, l);
+    switch (g_mode)
+    {
+    case MODE_SENSE:
+        ShowLine(0, "3 SENSE");
+        FmtCm(line, sizeof(line), "IRL", IR_LeftCm());       ShowLine(12, line);
+        FmtCm(line, sizeof(line), "IRR", IR_RightCm());      ShowLine(24, line);
+        FmtCm(line, sizeof(line), "US ", Ultrasonic_GetCm()); ShowLine(36, line);
+        snprintf(line, sizeof(line), "echoes %lu",
+                 (unsigned long)Ultrasonic_GetEchoCount());
+        ShowLine(48, line);
+        break;
 
-    snprintf(l, sizeof(l), "A%+7ld %3d", (long)tA, (int)g_rpmA);
-    ShowLine(16, l);
+    case MODE_IRCAL:
+        ShowLine(0, "4 IRCAL raw");
+        snprintf(line, sizeof(line), "L %4u cnt", IR_LeftRaw());
+        ShowLine(12, line);
+        snprintf(line, sizeof(line), "R %4u cnt", IR_RightRaw());
+        ShowLine(24, line);
+        snprintf(line, sizeof(line), "US %5u us", Ultrasonic_GetLastUs());
+        ShowLine(36, line);
+        ShowLine(48, "card @ known d");
+        break;
 
-    snprintf(l, sizeof(l), "B%+7ld %3d", (long)tB, (int)g_rpmB);
-    ShowLine(32, l);
+    case MODE_IMU:
+        ShowLine(0, "5 IMU gyro");
+        if (!IMU_IsReady())
+        {
+            ShowLine(12, "NOT READY");
+            snprintf(line, sizeof(line), "addr %02X id %02X",
+                     IMU_GetAddress(), IMU_GetWhoAmI());
+            ShowLine(24, line);
+            ShowLine(36, "PB12 high?");
+            ShowLine(48, "1.8V rail?");
+        }
+        else
+        {
+            long h10 = (long)(IMU_GetHeading() * 10.0f);
+            long r10 = (long)(IMU_GetRateDps() * 10.0f);
+            snprintf(line, sizeof(line), "addr %02X id %02X",
+                     IMU_GetAddress(), IMU_GetWhoAmI());
+            ShowLine(12, line);
+            snprintf(line, sizeof(line), "hd %ld.%ld deg",
+                     h10 / 10, (h10 < 0 ? -h10 : h10) % 10);
+            ShowLine(24, line);
+            snprintf(line, sizeof(line), "rate %ld.%ld dps",
+                     r10 / 10, (r10 < 0 ? -r10 : r10) % 10);
+            ShowLine(36, line);
+            snprintf(line, sizeof(line), "bias %d er %lu",
+                     IMU_GetBias(), (unsigned long)IMU_GetErrorCount());
+            ShowLine(48, line);
+        }
+        break;
 
-    switch (g_mode) {
-    case M_ENC: {
-        /* revolutions x10, from each wheel */
-        int32_t rA = (int32_t)((float)tA * 10.0f / TICKS_PER_REV);
-        int32_t rB = (int32_t)((float)tB * 10.0f / TICKS_PER_REV);
-        snprintf(l, sizeof(l), "rev A%3ld B%3ld", (long)rA, (long)rB);
+    case MODE_SETDIST:
+        ShowLine(0,  "2 SET DISTANCE");
+        snprintf(line, sizeof(line), "tgt %4ld mm", (long)g_targetMm);
+        ShowLine(12, line);
+        ShowLine(24, "short = +100");
+        snprintf(line, sizeof(line), "range %d-%d",
+                 (int)DIST_MIN_MM, (int)DIST_MAX_MM);
+        ShowLine(36, line);
+        ShowLine(48, "long = next mode");
         break;
-    }
-    case M_DUTY:
-        snprintf(l, sizeof(l), "OPEN LOOP %2d%%", OPEN_LOOP_DUTY_PCT);
-        break;
-    case M_RPM:
-        snprintf(l, sizeof(l), "TGT %3d RPM", (int)s_rpmCmd);
-        break;
-    case M_DIST: {
-        int32_t mmNow = (int32_t)(((float)((tA + tB) / 2) / COUNTS_PER_CM) * 10.0f);
-        int32_t mmTgt = (int32_t)(DIST_TARGET_CM * 10.0f);
-        snprintf(l, sizeof(l), "%5ldmm/%4ld", (long)mmNow, (long)mmTgt);
-        break;
-    }
+
+    case MODE_DRIVE:
     default:
-        l[0] = '\0';
+        /* No %f anywhere. newlib-nano will not print floats unless the float
+           printf is linked, and it fails silently rather than loudly. */
+        h10   = (int32_t)(Odom_GetHeading() * 10.0f);
+        whole = (long)(h10 / 10);
+        frac  = (long)(h10 % 10);
+        if (frac < 0) { frac = -frac; }
+
+        if (Motion_IsBusy())
+        {
+            /* Live view while moving. */
+            snprintf(line, sizeof(line), "1 DRIVE %s",
+                     st[(int)Motion_GetState()]);
+            ShowLine(0, line);
+            snprintf(line, sizeof(line), "tgt %4ld mm", (long)g_targetMm);
+            ShowLine(12, line);
+            snprintf(line, sizeof(line), "now %4ld mm",
+                     (long)Motion_GetTravelled());
+            ShowLine(24, line);
+            snprintf(line, sizeof(line), "A %ld B %ld",
+                     (long)Encoder_A_GetRPM(), (long)Encoder_B_GetRPM());
+            ShowLine(36, line);
+            snprintf(line, sizeof(line), "sv %u  hd %ld.%ld",
+                     (unsigned)Odom_GetServoUs(), whole, frac);
+            ShowLine(48, line);
+        }
+        else if (g_repValid)
+        {
+            /* Held result. This stays on screen until the next run starts,
+               so you can walk over with a tape measure and still read it.
+               Deliberately NOT driven off Motion_GetState() - the main loop
+               clears that to IDLE as soon as it has taken the reading, so a
+               live view would blank the answer almost immediately. */
+            long e10 = (g_repTarget != 0)
+                     ? (long)(((g_repMm - g_repTarget) * 1000) / g_repTarget)
+                     : 0L;
+            long ei  = e10 / 10;
+            long ef  = e10 % 10;
+            if (ef < 0) { ef = -ef; }
+
+            ShowLine(0, g_repTimeout ? "1 DRIVE TIMEOUT" : "1 DRIVE DONE");
+            snprintf(line, sizeof(line), "tgt %4ld mm", (long)g_repTarget);
+            ShowLine(12, line);
+            snprintf(line, sizeof(line), "got %4ld mm", (long)g_repMm);
+            ShowLine(24, line);
+            snprintf(line, sizeof(line), "err %s%ld.%ld %%",
+                     (e10 < 0) ? "-" : "+", (ei < 0) ? -ei : ei, ef);
+            ShowLine(36, line);
+            /* Encoder agreement for THIS run, driven rather than hand-rolled.
+               100% means both wheels counted the same. Anything well below
+               that is wheel B slipping under power, and it is the number to
+               watch before trusting any distance figure. */
+            if (g_repCntA != 0)
+            {
+                long r10 = (long)((g_repCntB * 1000) / g_repCntA);
+                if (r10 < 0) { r10 = -r10; }
+                snprintf(line, sizeof(line), "B/A %ld.%ld %%",
+                         r10 / 10, r10 % 10);
+            }
+            else
+            {
+                snprintf(line, sizeof(line), "B/A ---");
+            }
+            ShowLine(48, line);
+        }
+        else
+        {
+            ShowLine(0,  "1 DRIVE READY");
+            snprintf(line, sizeof(line), "tgt %4ld mm", (long)g_targetMm);
+            ShowLine(12, line);
+            ShowLine(24, "short = GO");
+            snprintf(line, sizeof(line), "A %ld B %ld rpm",
+                     (long)Encoder_A_GetRPM(), (long)Encoder_B_GetRPM());
+            ShowLine(36, line);
+            snprintf(line, sizeof(line), "sv %u us",
+                     (unsigned)Odom_GetServoUs());
+            ShowLine(48, line);
+        }
         break;
     }
-    ShowLine(48, l);
 
     OLED_Refresh_Gram();
+}
+
+/* ==========================================================================
+ *  Reporting
+ * ========================================================================== */
+
+static void PrintDriveReport(void)
+{
+    char     line[96];
+    int32_t  target   = g_repTarget;
+    int32_t  measured = g_repMm;
+    int32_t  err      = measured - target;
+    int32_t  err_x10  = (target != 0) ? ((err * 1000) / target) : 0;
+    long     ipart, fpart;
+
+    ipart = (long)(err_x10 / 10);
+    fpart = (long)(err_x10 % 10);
+    if (fpart < 0) { fpart = -fpart; }
+
+    RpiLink_Send("\r\n--- A.3 RUN ");
+    RpiLink_Send(g_repTimeout ? "TIMEOUT ---\r\n" : "DONE ---\r\n");
+
+    snprintf(line, sizeof(line), "commanded  %ld mm\r\n", (long)target);
+    RpiLink_Send(line);
+    snprintf(line, sizeof(line), "odometry   %ld mm  (%ld.%ld %% off)\r\n",
+             (long)measured, ipart, fpart);
+    RpiLink_Send(line);
+
+    snprintf(line, sizeof(line), "counts     A %ld   B %ld\r\n",
+             (long)g_repCntA, (long)g_repCntB);
+    RpiLink_Send(line);
+    if (g_repCntA != 0)
+    {
+        snprintf(line, sizeof(line), "B/A        %ld.%ld %%  (100 = agree)\r\n",
+                 (long)((g_repCntB * 1000) / g_repCntA) / 10,
+                 (long)((g_repCntB * 1000) / g_repCntA) % 10);
+        RpiLink_Send(line);
+    }
+
+    RpiLink_Send("Now TAPE MEASURE the real distance.\r\n");
+    RpiLink_Send("Two separate faults, two separate numbers:\r\n");
+    RpiLink_Send("  odometry vs TAPE  = wheel diameter\r\n");
+    RpiLink_Send("    WHEEL_DIAMETER_MM *= tape / odometry\r\n");
+    RpiLink_Send("  odometry vs COMMANDED = brake coast\r\n");
+    RpiLink_Send("    put the excess in MOTION_BRAKE_MM\r\n");
+    RpiLink_Send("Use odometry, not commanded, for the wheel -\r\n");
+    RpiLink_Send("odometry keeps counting through the coast, so\r\n");
+    RpiLink_Send("the tape/odometry ratio is coast-immune.\r\n");
+    RpiLink_Send("Five runs, average, then re-check.\r\n\r\n");
+}
+
+static void PrintSensors(void)
+{
+    char line[96];
+
+    snprintf(line, sizeof(line), "ENC A %ld  B %ld   (/10: %ld %ld)\r\n",
+             (long)Encoder_A_GetCount(), (long)Encoder_B_GetCount(),
+             (long)(Encoder_A_GetCount() / 10),
+             (long)(Encoder_B_GetCount() / 10));
+    RpiLink_Send(line);
+
+    snprintf(line, sizeof(line),
+             "IR raw L %4u R %4u   US echo %5u us  n=%lu\r\n",
+             IR_LeftRaw(), IR_RightRaw(), Ultrasonic_GetLastUs(),
+             (unsigned long)Ultrasonic_GetEchoCount());
+    RpiLink_Send(line);
+
+    snprintf(line, sizeof(line),
+             "IR cm  L %5u R %5u   US %5u cm   (%u = no reading)\r\n",
+             IR_LeftCm(), IR_RightCm(), Ultrasonic_GetCm(),
+             (unsigned)SENSOR_NO_READING);
+    RpiLink_Send(line);
 }
 
 /* ==========================================================================
@@ -581,51 +484,68 @@ static void Display(void)
 
 int main(void)
 {
-    uint32_t tDisp = 0, tLed = 0, tTele = 0;
+    uint32_t tDisp = 0, tLed = 0;
 
     HAL_Init();
     SystemClock_Config();
 
     MX_GPIO_Init();
 
-    /* Motor PWM up and at zero BEFORE anything can spin. Floating AT8236
-       inputs are a confirmed runaway mode on this board. */
+    /* Motor PWM up and pinned at zero BEFORE anything can spin. */
     MX_TIM4_Init();
     MX_TIM9_Init();
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0);
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, 0);
-    __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_1, 0);
-    __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_2, 0);
-    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
-    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
-    HAL_TIM_PWM_Start(&htim9, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim9, TIM_CHANNEL_2);
+    Motors_Init();
 
+    /* Steering next, so the front wheels are straight before the rears can
+       ever turn. */
     MX_TIM12_Init();
-    HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_2);
-    Servo_Set(SERVO_CENTER_US);
+    Servos_Init();
 
     MX_TIM2_Init();
     MX_TIM3_Init();
-    HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
-    HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
+    Encoders_Init();
+
+    PID_Init();
+    Odom_Init();
+    Motion_Init();
+
+    /* DMA clock must be up before the ADC MSP tries to HAL_DMA_Init on it. */
+    MX_DMA_Init();
+    MX_ADC1_Init();
+    MX_TIM8_Init();
+    IR_Init(&hadc1);
+    Ultrasonic_Init(&htim8);
 
     MX_USART3_UART_Init();
+    RpiLink_Init(&huart3);
+
     OLED_Init();
     OLED_Clear();
 
-    Enc_Zero();
-    Pid_Reset();
+    /* IMU last, and before the tick starts. IMU_Init() blocks for about two
+       and a half seconds measuring the zero-rate bias, and the robot must be
+       STILL and on the ground for all of it. Tell the user so they do not
+       pick the robot up while it is happening. */
+    MX_I2C2_Init();
+    ShowLine(0,  "IMU CALIBRATING");
+    ShowLine(12, "HOLD STILL...");
+    OLED_Refresh_Gram();
 
-    U3("\r\n=== C30D CALIBRATION BUILD ===\r\n");
-    U3("TICKS_PER_REV %d\r\n", (int)TICKS_PER_REV);
-    PrintFixed2("COUNTS_PER_CM ", (int32_t)(COUNTS_PER_CM * 100.0f), "");
-    PrintFixed2("DIST_TARGET   ", (int32_t)(DIST_TARGET_CM * 100.0f), " cm");
-    U3("ENC_INV A%d B%d  MOT_INV A%d B%d\r\n",
-       ENC_A_INVERT, ENC_B_INVERT, MOTOR_A_INVERT, MOTOR_B_INVERT);
-    U3("LONG press = mode, SHORT = action\r\n\r\n");
+    if (IMU_Init(&hi2c2))
+    {
+        RpiLink_Send("IMU ok\r\n");
+    }
+    else
+    {
+        RpiLink_Send("IMU FAILED - check PB12 high, 1.8V rail\r\n");
+    }
+    OLED_Clear();
 
-    /* Tick LAST — nothing fires against an uninitialised module. */
+    RpiLink_Send("\r\n=== C30D FUNCTIONAL TEST BUILD ===\r\n");
+    RpiLink_Send("LONG press = mode, SHORT = action\r\n");
+    RpiLink_Send("1 DRIVE 2 SETDIST 3 SENSE 4 IRCAL 5 IMU\r\n\r\n");
+
+    /* Tick LAST - nothing fires against an uninitialised module. */
     MX_TIM6_Init();
     HAL_TIM_Base_Start_IT(&htim6);
 
@@ -633,49 +553,85 @@ int main(void)
     {
         uint32_t now = HAL_GetTick();
 
+        IMU_Poll();
+        RpiLink_Poll();
+
+        if (g_reportReady)
+        {
+            g_reportReady = 0U;
+            Motion_ClearState();
+            if (g_mode == MODE_DRIVE) { PrintDriveReport(); }
+        }
+
+        if (g_evtLong)
+        {
+            g_evtLong  = 0U;
+            g_evtShort = 0U;
+
+            Cmd_QueueFlush();
+            Motion_Stop();
+            Motion_ClearState();
+            Motors_Coast();
+
+            g_mode = (uimode_t)(((int)g_mode + 1) % (int)MODE_COUNT);
+        }
+        else if (g_evtShort)
+        {
+            g_evtShort = 0U;
+
+            if (Motion_IsBusy())
+            {
+                Motion_Stop();
+                Motion_ClearState();
+                Motors_Coast();
+                RpiLink_Send("STOP\r\n");
+            }
+            else if (g_mode == MODE_IMU)
+            {
+                IMU_ResetHeading();
+                RpiLink_Send("IMU heading zeroed\r\n");
+            }
+            else if (g_mode == MODE_SETDIST)
+            {
+                g_targetMm += DIST_STEP_MM;
+                if (g_targetMm > DIST_MAX_MM) { g_targetMm = DIST_MIN_MM; }
+            }
+            else if (g_mode == MODE_DRIVE)
+            {
+                /* Latch the target with the run. If it were read back at the
+                   end instead, stepping the target afterwards would silently
+                   rewrite the error figure for a run already finished. */
+                g_repTarget = g_targetMm;
+                g_repValid  = 0U;
+                g_runStartA = Encoder_A_GetCount();
+                g_runStartB = Encoder_B_GetCount();
+
+                RpiLink_Send("\r\nA.3 run starting\r\n");
+                Motion_DriveDistance(g_targetMm);
+            }
+            else
+            {
+                PrintSensors();
+            }
+        }
+
         if (now - tDisp >= 150u) { tDisp = now; Display(); }
 
         /* LED3 (PE8, active low): slow blink idle, fast blink running */
-        if (now - tLed >= ((g_state == R_IDLE) ? 500u : 100u)) {
+        if (now - tLed >= (Motion_IsBusy() ? 100u : 500u))
+        {
             tLed = now;
-            HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_8);
-        }
-
-        /* live telemetry while running */
-        if (g_state == R_RUN && (now - tTele >= 250u)) {
-            tTele = now;
-            U3("A %ld (%d rpm)  B %ld (%d rpm)\r\n",
-               (long)g_totA, (int)g_rpmA, (long)g_totB, (int)g_rpmB);
-        }
-
-        /* end-of-run report */
-        if (g_reportReady) {
-            int32_t avg, est_x100, tgt;
-            g_reportReady = 0;
-
-            avg = g_repAvg;
-            tgt = g_repTarget;
-            est_x100 = (int32_t)(((float)avg / COUNTS_PER_CM) * 100.0f);
-
-            U3("\r\n--- RUN %s ---\r\n", g_repTimeout ? "TIMEOUT" : "DONE");
-            U3("counts  A %ld  B %ld  avg %ld\r\n",
-               (long)g_repA, (long)g_repB, (long)avg);
-            U3("target counts %ld   time %lu ms\r\n",
-               (long)tgt, (unsigned long)g_repMs);
-            PrintFixed2("commanded  ", (int32_t)(DIST_TARGET_CM * 100.0f), " cm");
-            PrintFixed2("est travel ", est_x100, " cm");
-            U3("Now tape-measure it, then set\r\n");
-            U3("COUNTS_PER_CM = %ld.%02ld * %d / measured_cm\r\n\r\n",
-               (long)((int32_t)(COUNTS_PER_CM * 100.0f) / 100),
-               (long)((int32_t)(COUNTS_PER_CM * 100.0f) % 100),
-               (int)DIST_TARGET_CM);
+            HAL_GPIO_TogglePin(GPIOE, LED3_Pin);
         }
     }
 }
 
 /* ==========================================================================
- *  Peripheral init. GPIO/AF/NVIC for every peripheral below is already
- *  handled by the generated stm32f4xx_hal_msp.c, so these only set registers.
+ *  Clocks
+ *
+ *  CubeMX 6.5.0 does NOT emit the voltage scale or the flash latency needed
+ *  for 168 MHz on this part. Both are hand-added below and will be silently
+ *  dropped again on the next code generation - check them every time.
  * ========================================================================== */
 
 void SystemClock_Config(void)
@@ -690,7 +646,7 @@ void SystemClock_Config(void)
     osc.HSEState       = RCC_HSE_ON;
     osc.PLL.PLLState   = RCC_PLL_ON;
     osc.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
-    osc.PLL.PLLM       = 8;
+    osc.PLL.PLLM       = 8;      /* 8 MHz crystal, not the 25 MHz default */
     osc.PLL.PLLN       = 336;
     osc.PLL.PLLP       = RCC_PLLP_DIV2;
     osc.PLL.PLLQ       = 4;
@@ -700,13 +656,104 @@ void SystemClock_Config(void)
                   | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
     clk.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
     clk.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    clk.APB1CLKDivider = RCC_HCLK_DIV4;    /* PCLK1 42 MHz, timers 84 MHz */
+    clk.APB1CLKDivider = RCC_HCLK_DIV4;    /* PCLK1 42 MHz, timers 84 MHz  */
     clk.APB2CLKDivider = RCC_HCLK_DIV2;    /* PCLK2 84 MHz, timers 168 MHz */
     if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_5) != HAL_OK) Error_Handler();
 }
 
-/* TIM2 — encoder A, PA15 / PB3. 32-bit part, ARR forced to 65535 so the
-   (int16_t) delta cast is valid. */
+/* ==========================================================================
+ *  Peripheral init. GPIO/AF/NVIC for every peripheral below is already
+ *  handled by the generated stm32f4xx_hal_msp.c, so these only set registers.
+ * ========================================================================== */
+
+static void MX_DMA_Init(void)
+{
+    __HAL_RCC_DMA2_CLK_ENABLE();
+
+    /* Enabled so a transfer error is still reported. The half- and
+       full-transfer interrupts are masked off in IR_Init(); see the comment
+       there for why leaving them on wrecks the control tick. */
+    HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 6, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+}
+
+/* ADC1 - IR left PC0 (IN10), IR right PC1 (IN11).
+   Scan, continuous, circular DMA. Once started it never needs touching.
+
+   480-cycle sampling is deliberate. The GP2Y0A21YK is a high-impedance
+   source behind a 1k/2.2k divider, and the datasheet's RAIN limit means a
+   short sample time would not let the ADC's hold capacitor charge fully -
+   the reading would sag toward whichever channel was converted before it. */
+static void MX_ADC1_Init(void)
+{
+    ADC_ChannelConfTypeDef ch = {0};
+
+    hadc1.Instance                   = ADC1;
+    hadc1.Init.ClockPrescaler        = ADC_CLOCK_SYNC_PCLK_DIV8;
+    hadc1.Init.Resolution            = ADC_RESOLUTION_12B;
+    hadc1.Init.ScanConvMode          = ENABLE;
+    hadc1.Init.ContinuousConvMode    = ENABLE;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc1.Init.ExternalTrigConv      = ADC_SOFTWARE_START;
+    hadc1.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.NbrOfConversion       = 2;
+    hadc1.Init.DMAContinuousRequests = ENABLE;
+    hadc1.Init.EOCSelection          = ADC_EOC_SEQ_CONV;
+    if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+
+    ch.Channel      = ADC_CHANNEL_10;         /* PC0, IR left  */
+    ch.Rank         = 1;
+    ch.SamplingTime = ADC_SAMPLETIME_480CYCLES;
+    if (HAL_ADC_ConfigChannel(&hadc1, &ch) != HAL_OK) Error_Handler();
+
+    ch.Channel      = ADC_CHANNEL_11;         /* PC1, IR right */
+    ch.Rank         = 2;
+    if (HAL_ADC_ConfigChannel(&hadc1, &ch) != HAL_OK) Error_Handler();
+}
+
+/* TIM8 - HC-SR04 echo capture on PC7 (CH2), both edges.
+   APB2 timer clock 168 MHz, PSC 167 -> 1 MHz, so one count is one
+   microsecond and the echo width is already in the units the HC-SR04
+   distance formula wants. ARR 65535 wraps every 65.5 ms, comfortably longer
+   than the 38 ms the sensor takes to give up.
+
+   ICFilter is 0 to match the .ioc. If the echo line picks up motor noise and
+   the lost-echo count in SENSE mode climbs, raise it to 3 - that rejects
+   glitches under ~50 ns and delays both edges equally, so the measured width
+   is unaffected. */
+static void MX_TIM8_Init(void)
+{
+    TIM_MasterConfigTypeDef mst = {0};
+    TIM_IC_InitTypeDef      ic  = {0};
+
+    htim8.Instance               = TIM8;
+    htim8.Init.Prescaler         = 168 - 1;
+    htim8.Init.CounterMode       = TIM_COUNTERMODE_UP;
+    htim8.Init.Period            = 65535;
+    htim8.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+    htim8.Init.RepetitionCounter = 0;
+    htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+    /* Base init first: the generated MSP hangs the TIM8 clock, the PC7 AF3
+       pin config and the NVIC entry off HAL_TIM_Base_MspInit, not off the
+       IC one. Calling only HAL_TIM_IC_Init gives a timer with no clock. */
+    if (HAL_TIM_Base_Init(&htim8) != HAL_OK) Error_Handler();
+    if (HAL_TIM_IC_Init(&htim8) != HAL_OK) Error_Handler();
+
+    mst.MasterOutputTrigger = TIM_TRGO_RESET;
+    mst.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &mst) != HAL_OK) Error_Handler();
+
+    ic.ICPolarity  = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
+    ic.ICSelection = TIM_ICSELECTION_DIRECTTI;
+    ic.ICPrescaler = TIM_ICPSC_DIV1;
+    ic.ICFilter    = 0;
+    if (HAL_TIM_IC_ConfigChannel(&htim8, &ic, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+}
+
+/* TIM2 - encoder A, PA15 / PB3. 32-bit part, ARR forced to 65535 so the
+   (int16_t) delta cast in encoders.c is valid. */
 static void MX_TIM2_Init(void)
 {
     TIM_Encoder_InitTypeDef enc = {0};
@@ -735,7 +782,7 @@ static void MX_TIM2_Init(void)
     if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &mst) != HAL_OK) Error_Handler();
 }
 
-/* TIM3 — encoder B, PB4 / PB5 */
+/* TIM3 - encoder B, PB4 / PB5. */
 static void MX_TIM3_Init(void)
 {
     TIM_Encoder_InitTypeDef enc = {0};
@@ -764,7 +811,7 @@ static void MX_TIM3_Init(void)
     if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &mst) != HAL_OK) Error_Handler();
 }
 
-/* TIM4 — motor A PWM. APB1 timer clock 84 MHz, ARR 4199 -> 20 kHz. */
+/* TIM4 - motor A PWM. APB1 timer clock 84 MHz, PSC 0, ARR 4199 -> 20 kHz. */
 static void MX_TIM4_Init(void)
 {
     TIM_MasterConfigTypeDef mst = {0};
@@ -773,7 +820,7 @@ static void MX_TIM4_Init(void)
     htim4.Instance               = TIM4;
     htim4.Init.Prescaler         = 0;
     htim4.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim4.Init.Period            = PWM_MAX;
+    htim4.Init.Period            = MOTOR_TIM_ARR;
     htim4.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
     htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
     if (HAL_TIM_PWM_Init(&htim4) != HAL_OK) Error_Handler();
@@ -792,15 +839,15 @@ static void MX_TIM4_Init(void)
     HAL_TIM_MspPostInit(&htim4);
 }
 
-/* TIM6 — 10 ms control tick. 84 MHz / 8400 = 10 kHz, / 100 = 100 Hz. */
+/* TIM6 - control tick. 84 MHz / 8400 = 10 kHz, / 100 = 100 Hz = 10 ms. */
 static void MX_TIM6_Init(void)
 {
     TIM_MasterConfigTypeDef mst = {0};
 
-    htim6.Instance           = TIM6;
-    htim6.Init.Prescaler     = 8399;
-    htim6.Init.CounterMode   = TIM_COUNTERMODE_UP;
-    htim6.Init.Period        = 99;
+    htim6.Instance               = TIM6;
+    htim6.Init.Prescaler         = 8399;
+    htim6.Init.CounterMode       = TIM_COUNTERMODE_UP;
+    htim6.Init.Period            = 99;
     htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
     if (HAL_TIM_Base_Init(&htim6) != HAL_OK) Error_Handler();
 
@@ -809,8 +856,8 @@ static void MX_TIM6_Init(void)
     if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &mst) != HAL_OK) Error_Handler();
 }
 
-/* TIM9 — motor B PWM. APB2 timer clock 168 MHz, PSC 1 -> 84 MHz,
-   ARR 4199 -> 20 kHz, identical to TIM4. */
+/* TIM9 - motor B PWM. APB2 timer clock 168 MHz, PSC 1 -> 84 MHz,
+   ARR 4199 -> 20 kHz, identical scale to TIM4. */
 static void MX_TIM9_Init(void)
 {
     TIM_OC_InitTypeDef oc = {0};
@@ -818,7 +865,7 @@ static void MX_TIM9_Init(void)
     htim9.Instance               = TIM9;
     htim9.Init.Prescaler         = 1;
     htim9.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim9.Init.Period            = PWM_MAX;
+    htim9.Init.Period            = MOTOR_TIM_ARR;
     htim9.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
     htim9.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
     if (HAL_TIM_PWM_Init(&htim9) != HAL_OK) Error_Handler();
@@ -833,7 +880,7 @@ static void MX_TIM9_Init(void)
     HAL_TIM_MspPostInit(&htim9);
 }
 
-/* TIM12 — servo. APB1 timer clock 84 MHz, PSC 83 -> 1 MHz (1 us/count),
+/* TIM12 - servo. APB1 timer clock 84 MHz, PSC 83 -> 1 MHz (1 us/count),
    ARR 19999 -> 50 Hz. NOTE: PSC is 83, not 167. TIM12 is on APB1. */
 static void MX_TIM12_Init(void)
 {
@@ -856,10 +903,59 @@ static void MX_TIM12_Init(void)
     HAL_TIM_MspPostInit(&htim12);
 }
 
+/* I2C2 - ICM-20948 gyro on PB10 (SCL) and PB11 (SDA), AF4.
+ *
+ * The pin setup is done HERE rather than in a HAL_I2C_MspInit(). I2C2 is not
+ * in the .ioc, so the generated stm32f4xx_hal_msp.c has no I2C handler and
+ * HAL_I2C_Init() will call the empty __weak one. Defining our own MspInit in
+ * this file would work today and collide the day anyone regenerates from
+ * CubeMX with I2C enabled. Doing it inline avoids that entirely.
+ *
+ * Open drain with the internal pull-ups on. The board's visible pull-ups sit
+ * on the 1.8 V side of the RS0102 level shifter, so they do NOT pull up this
+ * side of the bus. Without GPIO_PULLUP here the lines never rise and every
+ * transaction times out. */
+static void MX_I2C2_Init(void)
+{
+    GPIO_InitTypeDef g = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    g.Pin       = GPIO_PIN_10 | GPIO_PIN_11;
+    g.Mode      = GPIO_MODE_AF_OD;
+    g.Pull      = GPIO_PULLUP;
+    g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    g.Alternate = GPIO_AF4_I2C2;
+    HAL_GPIO_Init(GPIOB, &g);
+
+    /* PB12 = nCS on the ICM-20948. HIGH selects I2C; low leaves the part in
+       SPI mode where it ignores the bus completely. IMU_Init() drives it too,
+       but set it here so it is high before the first transaction. */
+    g.Pin   = GPIO_PIN_12;
+    g.Mode  = GPIO_MODE_OUTPUT_PP;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &g);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+
+    __HAL_RCC_I2C2_CLK_ENABLE();
+
+    hi2c2.Instance             = I2C2;
+    hi2c2.Init.ClockSpeed      = 400000;          /* fast mode */
+    hi2c2.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+    hi2c2.Init.OwnAddress1     = 0;
+    hi2c2.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+    hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c2.Init.OwnAddress2     = 0;
+    hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c2.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+    if (HAL_I2C_Init(&hi2c2) != HAL_OK) Error_Handler();
+}
+
 static void MX_USART3_UART_Init(void)
 {
     huart3.Instance          = USART3;
-    huart3.Init.BaudRate     = 115200;
+    huart3.Init.BaudRate     = CMD_BAUD_RATE;
     huart3.Init.WordLength   = UART_WORDLENGTH_8B;
     huart3.Init.StopBits     = UART_STOPBITS_1;
     huart3.Init.Parity       = UART_PARITY_NONE;
@@ -870,7 +966,8 @@ static void MX_USART3_UART_Init(void)
 }
 
 /* Only the pins the MSP does not own: OLED bit-bang, LED3, user button,
-   and the ultrasonic trigger held low so it cannot chirp. */
+   and the ultrasonic trigger. PC0/PC1 (analog) and PC7 (AF3) are configured
+   by HAL_ADC_MspInit and HAL_TIM_Base_MspInit respectively. */
 static void MX_GPIO_Init(void)
 {
     GPIO_InitTypeDef g = {0};
@@ -903,7 +1000,8 @@ static void MX_GPIO_Init(void)
     g.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOE, &g);
 
-    /* Ultrasonic trigger PB14 parked low */
+    /* Ultrasonic trigger PB14, starts low so the sensor cannot chirp before
+       Ultrasonic_Init() owns it. */
     g.Pin   = US_Trig_Pin;
     g.Mode  = GPIO_MODE_OUTPUT_PP;
     g.Pull  = GPIO_NOPULL;
@@ -914,10 +1012,15 @@ static void MX_GPIO_Init(void)
 
 void Error_Handler(void)
 {
+    /* Kill the motors before parking. An Error_Handler that spins with the
+       bridges still driven is how a bench test becomes a chase. */
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0);
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, 0);
+    __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_1, 0);
+    __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_2, 0);
+
     __disable_irq();
     while (1) { }
 }
 
-#ifdef USE_FULL_ASSERT
 void assert_failed(uint8_t *file, uint32_t line) { (void)file; (void)line; }
-#endif

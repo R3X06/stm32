@@ -37,6 +37,30 @@
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
 
+/* Cut motor drive from inside a fault handler.
+ *
+ * The PWM timers are hardware and do not stop when the CPU faults. Whatever
+ * duty was last written to TIM4/TIM9 keeps being output forever while the
+ * handler sits in its while(1), so a fault at cruise leaves the robot driving
+ * at cruise until someone reaches the power switch.
+ *
+ * Direct register writes, not HAL calls: in a fault context the handle
+ * structs may be exactly what is corrupted, and HAL_TIM_* would dereference
+ * them. TIMx->CCRn is a fixed address that is always valid.
+ *
+ * CCR = 0 with the counter STILL RUNNING is the correct way to do this. In
+ * PWM1 mode that holds the output low for the whole period, which pulls both
+ * AT8236 inputs low and coasts the motor. Clearing CEN instead would freeze
+ * the pin at whatever level it happened to be at - and half the time that is
+ * HIGH, which drives the motor rather than stopping it. */
+#define KILL_MOTORS()          \
+  do {                         \
+    TIM4->CCR3 = 0U;           \
+    TIM4->CCR4 = 0U;           \
+    TIM9->CCR1 = 0U;           \
+    TIM9->CCR2 = 0U;           \
+  } while (0)
+
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -72,7 +96,7 @@ extern UART_HandleTypeDef huart3;
 void NMI_Handler(void)
 {
   /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-
+  KILL_MOTORS();
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
   while (1)
@@ -87,7 +111,7 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  KILL_MOTORS();
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -102,7 +126,7 @@ void HardFault_Handler(void)
 void MemManage_Handler(void)
 {
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
+  KILL_MOTORS();
   /* USER CODE END MemoryManagement_IRQn 0 */
   while (1)
   {
@@ -117,7 +141,7 @@ void MemManage_Handler(void)
 void BusFault_Handler(void)
 {
   /* USER CODE BEGIN BusFault_IRQn 0 */
-
+  KILL_MOTORS();
   /* USER CODE END BusFault_IRQn 0 */
   while (1)
   {
@@ -132,7 +156,7 @@ void BusFault_Handler(void)
 void UsageFault_Handler(void)
 {
   /* USER CODE BEGIN UsageFault_IRQn 0 */
-
+  KILL_MOTORS();
   /* USER CODE END UsageFault_IRQn 0 */
   while (1)
   {

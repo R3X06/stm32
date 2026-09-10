@@ -2,12 +2,35 @@
 #include "encoders.h"
 #include "pid.h"
 #include "motors.h"
+#include "imu.h"
 #include <math.h>
 
 static Odom_Pose_t s_pose;
 
 static int32_t s_lastCountA;
 static int32_t s_lastCountB;
+
+/* Previous gyro heading, so the per-tick delta can be differenced out of the
+ * IMU's free-running total. */
+static float   s_lastImuHeading;
+
+/* Drive mode. OFF means nothing here touches the motors or the servo. */
+typedef enum
+{
+    ODOM_OFF = 0,
+    ODOM_STRAIGHT,
+    ODOM_ARC
+} OdomMode_t;
+
+static OdomMode_t s_mode;
+
+/* Arc state: the two rear wheel setpoints, precomputed from the geometry,
+ * plus the scale factors so a speed change can be reapplied without
+ * re-deriving the geometry or touching the servo. */
+static int16_t  s_arcRpmA;
+static int16_t  s_arcRpmB;
+static float    s_arcScaleA = 1.0f;
+static float    s_arcScaleB = 1.0f;
 
 /* Heading hold state */
 static uint8_t  s_holdActive;
@@ -50,8 +73,11 @@ void Odom_Init(void)
     s_lastCountA = Encoder_A_GetCount();
     s_lastCountB = Encoder_B_GetCount();
 
+    s_mode       = ODOM_OFF;
     s_holdActive = 0U;
     s_holdRpm    = 0;
+    s_arcRpmA    = 0;
+    s_arcRpmB    = 0;
     s_error      = 0.0f;
     s_servoUs    = SERVO_CENTER_US;
 
@@ -60,10 +86,38 @@ void Odom_Init(void)
 
 void Odom_Reset(void)
 {
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+
     s_pose.x_mm        = 0.0f;
     s_pose.y_mm        = 0.0f;
     s_pose.heading_deg = 0.0f;
     s_pose.distance_mm = 0.0f;
+
+    /* Resync the cached counts against the live encoders.
+     *
+     * Without this, Odom_Reset() only zeroes the pose while s_lastCountA/B
+     * keep whatever they held, so the next Odom_Update() computes its delta
+     * against a stale baseline. That is harmless as long as the encoder
+     * counters themselves never move underneath us - but the moment anything
+     * calls Encoders_Reset(), the counts drop to zero and the next tick sees
+     * a delta of minus fifteen thousand counts, which is about two metres of
+     * phantom travel injected in 10 ms.
+     *
+     * Interrupts are masked because the control tick reads exactly these two
+     * variables, and a reset landing mid-update would leave one wheel synced
+     * and the other not. */
+    s_lastCountA = Encoder_A_GetCount();
+    s_lastCountB = Encoder_B_GetCount();
+
+    /* Zero the gyro total too, and resync the baseline against it. Without
+     * this the next tick differences the new pose against a heading the IMU
+     * accumulated before the reset, and the first tick of every move gets a
+     * step of whatever the robot had turned since boot. */
+    IMU_ResetHeading();
+    s_lastImuHeading = 0.0f;
+
+    __set_PRIMASK(primask);
 }
 
 void Odom_Update(void)
@@ -81,8 +135,8 @@ void Odom_Update(void)
     countB = Encoder_B_GetCount();
 
     /* Distance each wheel rolled since the last tick. */
-    dA_mm = (float)(countA - s_lastCountA) * MM_PER_COUNT;
-    dB_mm = (float)(countB - s_lastCountB) * MM_PER_COUNT;
+    dA_mm = (float)(countA - s_lastCountA) * MM_PER_COUNT_A;
+    dB_mm = (float)(countB - s_lastCountB) * MM_PER_COUNT_B;
 
     s_lastCountA = countA;
     s_lastCountB = countB;
@@ -94,8 +148,42 @@ void Odom_Update(void)
      * On an Ackermann chassis the two rear wheels differ only slightly on a
      * gentle curve, so this heading estimate is noisy. It is good enough for
      * A.3 and A.4; the IMU will replace it later. */
+    /* Distance source. The heading term below ALWAYS uses both wheels - it is
+     * a difference, so there is no single-wheel substitute - but the distance
+     * travelled can come from one encoder alone when the other is not
+     * trustworthy. See ODOM_DIST_SOURCE in odom.h. */
+#if   ODOM_DIST_SOURCE == ODOM_DIST_A_ONLY
+    d_centre    = dA_mm;
+#elif ODOM_DIST_SOURCE == ODOM_DIST_B_ONLY
+    d_centre    = dB_mm;
+#else
     d_centre    = (dA_mm + dB_mm) * 0.5f;
+#endif
+    /* Heading change this tick.
+     *
+     * The gyro measures yaw directly, so wheel scale error, slip and tyre
+     * scrub cannot corrupt it - all three of which the encoder difference is
+     * wide open to. IMU_GetHeading() is a free-running total, so difference
+     * it rather than using it as an absolute: that keeps everything below,
+     * including the wrap to +-180 and the pose integration, working exactly
+     * as it did with the encoder estimate.
+     *
+     * Falls back automatically if the IMU never came up, so a dead sensor
+     * costs accuracy rather than leaving the robot with no heading at all. */
+#if ODOM_HEADING_SOURCE == ODOM_HEADING_IMU
+    if (IMU_IsReady())
+    {
+        float h = IMU_GetHeading();
+        d_theta_deg      = h - s_lastImuHeading;
+        s_lastImuHeading = h;
+    }
+    else
+    {
+        d_theta_deg = ((dA_mm - dB_mm) / WHEEL_BASE_MM) * (180.0f / 3.14159265f);
+    }
+#else
     d_theta_deg = ((dA_mm - dB_mm) / WHEEL_BASE_MM) * (180.0f / 3.14159265f);
+#endif
 
     /* Integrate at the midpoint heading rather than the start heading. */
     heading_rad = (s_pose.heading_deg + d_theta_deg * 0.5f) * (3.14159265f / 180.0f);
@@ -110,7 +198,13 @@ void Odom_Update(void)
 
     /* ---- heading hold, via the steering servo ---- */
 
-    if (s_holdActive)
+    if (s_mode == ODOM_ARC)
+    {
+        /* Servo is already parked at the arc angle. Just keep the two wheel
+         * setpoints applied; there is no heading correction during a turn. */
+        PID_SetTargets(s_arcRpmA, s_arcRpmB);
+    }
+    else if (s_holdActive)
     {
         s_error = wrap180(s_holdHeading - s_pose.heading_deg);
 
@@ -195,11 +289,87 @@ void Odom_DriveHeading(int16_t rpm, float heading_deg)
 
     Servo_SetMicroseconds(SERVO_CENTER_US);
     s_holdActive  = 1U;
+    s_mode        = ODOM_STRAIGHT;
+}
+
+void Odom_DriveArc(int16_t rpm, uint16_t servo_us, float radius_mm, uint8_t right)
+{
+    float half_track = WHEEL_BASE_MM * 0.5f;
+    float inner_scale;
+    float outer_scale;
+    float mag;
+
+    /* A radius inside the track width would ask the inner wheel to run
+     * backwards, which this chassis cannot steer tightly enough to need.
+     * Clamp rather than produce a nonsense setpoint. */
+    if (radius_mm < (half_track + 1.0f))
+    {
+        radius_mm = half_track + 1.0f;
+    }
+
+    inner_scale = (radius_mm - half_track) / radius_mm;
+    outer_scale = (radius_mm + half_track) / radius_mm;
+
+    /* Scale about the axle-centre speed so the CENTRE runs at the requested
+     * rpm. That keeps Odom_GetDistance(), which averages the two wheels,
+     * measuring the arc length the caller asked for. */
+    mag = (float)rpm;
+
+    if (right)
+    {
+        /* Curving right: B (right rear) is the inner wheel. */
+        s_arcScaleA = outer_scale;
+        s_arcScaleB = inner_scale;
+    }
+    else
+    {
+        s_arcScaleA = inner_scale;
+        s_arcScaleB = outer_scale;
+    }
+
+    s_arcRpmA = (int16_t)(mag * s_arcScaleA);
+    s_arcRpmB = (int16_t)(mag * s_arcScaleB);
+
+    s_holdActive = 0U;
+    s_error      = 0.0f;
+    s_servoUs    = servo_us;
+
+    Servo_SetMicroseconds(servo_us);
+    PID_SetTargets(s_arcRpmA, s_arcRpmB);
+
+    s_mode = ODOM_ARC;
+}
+
+void Odom_SetSpeed(int16_t rpm)
+{
+    if (s_mode == ODOM_ARC)
+    {
+        s_arcRpmA = (int16_t)((float)rpm * s_arcScaleA);
+        s_arcRpmB = (int16_t)((float)rpm * s_arcScaleB);
+        PID_SetTargets(s_arcRpmA, s_arcRpmB);
+    }
+    else if (s_mode == ODOM_STRAIGHT)
+    {
+        /* s_holdRpm also carries the sign the heading correction is flipped
+         * by when reversing, so it must be updated even though the servo is
+         * deliberately left alone. */
+        s_holdRpm = rpm;
+        PID_SetTargets(rpm, rpm);
+    }
+    else
+    {
+        /* Not driving. Nothing to change. */
+    }
 }
 
 void Odom_Stop(void)
 {
+    s_mode       = ODOM_OFF;
     s_holdActive = 0U;
+    s_arcRpmA    = 0;
+    s_arcRpmB    = 0;
+    s_arcScaleA  = 1.0f;
+    s_arcScaleB  = 1.0f;
     s_error      = 0.0f;
     s_servoUs    = SERVO_CENTER_US;
 

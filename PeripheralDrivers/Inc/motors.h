@@ -33,13 +33,20 @@
  * ---------------------------------------------------------------------------
  * PINS DELIBERATELY LEFT FREE - do not use:
  *
- *   PC6, PC7   HC-SR04 trig + echo (TIM8_CH2 capture)   - Person B
+ *   PB14       HC-SR04 trigger, plain GPIO out, header J6
+ *   PC7        HC-SR04 echo, TIM8_CH2 capture, header J2
  *   PB10, PB11 I2C2, ICM20948 IMU                       - Person B
  *
  * Note PB10/PB11 are also USART3_TX/RX on AF7. USART3 must stay on PD8/PD9
  * or it takes the IMU bus, and the failure looks nothing like a pin clash.
  *
- * PB14 is TIM12_CH1 - a second servo can go there later at no timer cost.
+ * PB14 IS NOT AVAILABLE FOR A SECOND SERVO. It is TIM12_CH1 electrically, and
+ * J6 is a 3-pin servo-style header with 5V5 and GND on it, which is exactly
+ * why it suits the HC-SR04 - the module gets its 5 V from the same connector.
+ * But the trigger owns that pin. There is ONE servo on this robot, on PB15.
+ *
+ * PC6, PC8 and PC9 are also free servo-style headers (J1, J4, J5) if a second
+ * servo is ever needed. PC7 is not - the echo capture has it.
  *
  * ---------------------------------------------------------------------------
  * NOT USED HERE, but noted so you do not trip over it later:
@@ -82,7 +89,24 @@
 #define MOTOR_A_MAX_RPM  378
 #define MOTOR_B_MAX_RPM  362
 
-/* Set to 1 if a motor spins the wrong way for a positive speed. */
+/* Set to 1 if a motor spins the wrong way for a positive speed.
+ *
+ * B CHANGED FROM 1 TO 0 - VERIFY THIS ON THE STAND BEFORE A FLOOR RUN.
+ *
+ * These did not agree with the calibration build that was in main.c. Working
+ * it through channel by channel:
+ *
+ *   Motor A: motors.c passes CH3 as in1 and CH4 as in2, so INVERT 1 puts the
+ *            PWM on CH4 (PB9) for a positive speed. The calibration build put
+ *            it on CH4 too. Same behaviour - A stays at 1.
+ *
+ *   Motor B: motors.c passes CH1 as in1 and CH2 as in2, so INVERT 1 put the
+ *            PWM on CH2 (PE6) for a positive speed. The calibration build put
+ *            it on CH1 (PE5). Opposite - so B becomes 0 to match.
+ *
+ * The calibration build is the more recent of the two and is the one that was
+ * driven on the bench, so it wins. If Motor B turns out to run backwards,
+ * put this back to 1 and re-check A at the same time. */
 #define MOTOR_A_INVERT      1
 #define MOTOR_B_INVERT      1
 

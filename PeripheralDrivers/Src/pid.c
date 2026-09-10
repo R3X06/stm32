@@ -5,6 +5,11 @@
 static PID_t s_pidA;
 static PID_t s_pidB;
 
+/* One flag for the pair. The per-struct 'enabled' fields are kept for
+ * introspection but this is what PID_Update() gates on - the old code tested
+ * s_pidA.enabled only, which meant wheel B silently inherited A's state. */
+static volatile uint8_t s_enabled;
+
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
@@ -156,6 +161,8 @@ void PID_Init(void)
     s_pidB.max_rpm = MOTOR_B_MAX_RPM;
     s_pidB.enabled = 0U;
     pid_reset(&s_pidB);
+
+    s_enabled = 0U;
 }
 
 void PID_Enable(uint8_t on)
@@ -171,7 +178,10 @@ void PID_Enable(uint8_t on)
 
     s_pidA.enabled = on ? 1U : 0U;
     s_pidB.enabled = s_pidA.enabled;
+    s_enabled      = s_pidA.enabled;
 }
+
+uint8_t PID_IsEnabled(void) { return s_enabled; }
 
 static int16_t clamp_target(int16_t rpm, int16_t max_rpm)
 {
@@ -209,7 +219,11 @@ void PID_Update(void)
     int16_t out_a;
     int16_t out_b;
 
-    if (!s_pidA.enabled)
+    /* While disabled the motors are left entirely alone. This is what lets
+     * the motion layer brake: it calls PID_Enable(0) and THEN Motors_Brake(),
+     * and the next tick does not come along and overwrite the brake with a
+     * coast. */
+    if (!s_enabled)
     {
         return;
     }

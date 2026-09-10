@@ -59,6 +59,9 @@ void PID_Init(void);
  * alone, so open-loop Motor_x_Set() calls still work for testing. */
 void PID_Enable(uint8_t on);
 
+/* 1 while the closed loop is driving the motors. */
+uint8_t PID_IsEnabled(void);
+
 /* Setpoints in wheel RPM. Negative runs the wheel in reverse. Values beyond
  * that wheel's measured maximum are clamped. */
 void PID_SetTargetA(int16_t rpm);

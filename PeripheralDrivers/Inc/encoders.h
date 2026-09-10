@@ -29,14 +29,27 @@
  *
  * The timers count in hardware, so a slow main loop costs speed resolution
  * but never loses position.
+ * ---------------------------------------------------------------------------
+ * TIMING CONTRACT  (changed - read this)
+ *
+ * Encoders_Update() is now called from the TIM6 control tick at a FIXED
+ * ENCODER_TICK_MS interval, NOT from the main loop. It no longer rate-limits
+ * itself and no longer calls HAL_GetTick().
+ *
+ * Why: the old version rate-limited on HAL_GetTick() at 20 ms while the PID
+ * runs at 10 ms, so every second control step acted on a stale measurement
+ * and Odom_Update() saw a wheel delta that alternated between 0 and double.
+ * It also read HAL_GetTick() from an interrupt that pre-empts SysTick, so
+ * the measured interval jittered between 9 and 11 ms and scaled every RPM
+ * reading by up to +-10%.
+ *
+ * Call it FIRST in the tick, exactly once per tick, and nowhere else.
  * ------------------------------------------------------------------------- */
 
 /* ---- CALIBRATE THESE FOR YOUR MOTORS --------------------------------------
  * ENCODER_PPR is pulses per revolution of the MOTOR shaft on ONE channel,
  * before the gearbox and before the x4 quadrature multiplication.
- * The defaults suit a JGB37-520 style gearmotor (11 PPR, 30:1). Check your
- * motor - a wrong value scales every distance and speed reading by a
- * constant factor.
+ * 13 * 4 * 30 = 1560, which is the ten-revolution measured figure.
  *
  * Easiest measurement: mark the wheel, call Encoders_Reset(), turn the wheel
  * exactly 10 revolutions by hand, read Encoder_A_GetCount(), divide by 10.
@@ -51,13 +64,25 @@
 #define ENCODER_A_INVERT        0
 #define ENCODER_B_INVERT        1
 
-/* Minimum gap between samples. Shorter is more responsive but noisier. */
-#define ENCODER_SAMPLE_MS       20U
+/* Period at which Encoders_Update() is called. MUST equal the TIM6 tick and
+ * PID_DT_MS. Position accumulates every tick. */
+#define ENCODER_TICK_MS         10U
+
+/* RPM is averaged over this many ticks.
+ *
+ * One count at a 10 ms window is 60000/(1560*10) = 3.85 RPM, which is far
+ * too coarse to feed a loop that is meant to hold +-1 RPM - the feedback
+ * would quantise into 4 RPM steps and the integrator would chase the
+ * rounding. Over 4 ticks (40 ms) one count is 0.96 RPM instead.
+ *
+ * Position is still integrated every single tick, so odometry loses nothing.
+ * The only cost is 40 ms of lag in the speed feedback, which at these motor
+ * time constants is well inside the loop bandwidth. */
+#define ENCODER_RPM_WINDOW      4U
 
 void Encoders_Init(void);
 
-/* Call from the main loop as often as you like. Rate-limits itself to
- * ENCODER_SAMPLE_MS and returns immediately in between. */
+/* One fixed-period sample. Call from the TIM6 ISR, first, once per tick. */
 void Encoders_Update(void);
 
 /* Zeroes accumulated position. Does not disturb speed readings. */
@@ -66,11 +91,12 @@ void Encoders_Reset(void);
 int32_t Encoder_A_GetCount(void);
 int32_t Encoder_B_GetCount(void);
 
+/* Counts in the most recent single tick. */
 int16_t Encoder_A_GetDelta(void);
 int16_t Encoder_B_GetDelta(void);
 
-/* Output-shaft speed in whole RPM, signed. Integer maths throughout, so it
- * is safe with a non-float-enabled printf. */
+/* Output-shaft speed in whole RPM, signed, averaged over ENCODER_RPM_WINDOW
+ * ticks. Integer maths throughout, so it is safe with a non-float printf. */
 int32_t Encoder_A_GetRPM(void);
 int32_t Encoder_B_GetRPM(void);
 

@@ -4,21 +4,27 @@
 extern TIM_HandleTypeDef htim2;   /* encoder A: PA15 / PB3 */
 extern TIM_HandleTypeDef htim3;   /* encoder B: PB4  / PB5 */
 
-static int32_t  s_countA;
-static int32_t  s_countB;
-static int16_t  s_deltaA;
-static int16_t  s_deltaB;
+static volatile int32_t s_countA;
+static volatile int32_t s_countB;
+static volatile int16_t s_deltaA;
+static volatile int16_t s_deltaB;
 
 static uint16_t s_lastRawA;
 static uint16_t s_lastRawB;
 
-static uint32_t s_lastTick;
-static uint32_t s_lastIntervalMs = ENCODER_SAMPLE_MS;
+/* Sliding window of per-tick deltas, and its running sum. */
+static int16_t  s_winA[ENCODER_RPM_WINDOW];
+static int16_t  s_winB[ENCODER_RPM_WINDOW];
+static uint8_t  s_winIdx;
+static volatile int32_t s_sumA;
+static volatile int32_t s_sumB;
 
 /* ------------------------------------------------------------------ */
 
 void Encoders_Init(void)
 {
+    uint8_t i;
+
     HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
     HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
 
@@ -32,8 +38,14 @@ void Encoders_Init(void)
     s_deltaA   = 0;
     s_deltaB   = 0;
 
-    s_lastTick       = HAL_GetTick();
-    s_lastIntervalMs = ENCODER_SAMPLE_MS;
+    for (i = 0U; i < ENCODER_RPM_WINDOW; i++)
+    {
+        s_winA[i] = 0;
+        s_winB[i] = 0;
+    }
+    s_winIdx = 0U;
+    s_sumA   = 0;
+    s_sumB   = 0;
 }
 
 void Encoders_Reset(void)
@@ -50,25 +62,17 @@ void Encoders_Reset(void)
 
 void Encoders_Update(void)
 {
-    uint32_t now = HAL_GetTick();
-    uint32_t elapsed = now - s_lastTick;   /* wraps correctly at 49.7 days */
-
     uint16_t rawA;
     uint16_t rawB;
     int16_t  dA;
     int16_t  dB;
-
-    if (elapsed < ENCODER_SAMPLE_MS)
-    {
-        return;
-    }
 
     rawA = (uint16_t)(__HAL_TIM_GET_COUNTER(&htim2) & 0xFFFFU);
     rawB = (uint16_t)(__HAL_TIM_GET_COUNTER(&htim3) & 0xFFFFU);
 
     /* Unsigned 16-bit subtraction cast to signed handles wraparound in both
      * directions with no special case, provided the wheel moves less than
-     * 32767 counts between samples. At 20 ms that is far beyond what a
+     * 32767 counts between samples. At 10 ms that is far beyond what a
      * gearmotor can physically do. */
     dA = (int16_t)(rawA - s_lastRawA);
     dB = (int16_t)(rawB - s_lastRawB);
@@ -89,8 +93,21 @@ void Encoders_Update(void)
     s_countA += (int32_t)dA;
     s_countB += (int32_t)dB;
 
-    s_lastIntervalMs = elapsed;
-    s_lastTick       = now;
+    /* Slide the RPM window: drop the oldest sample, add the newest. */
+    s_sumA -= (int32_t)s_winA[s_winIdx];
+    s_sumB -= (int32_t)s_winB[s_winIdx];
+
+    s_winA[s_winIdx] = dA;
+    s_winB[s_winIdx] = dB;
+
+    s_sumA += (int32_t)dA;
+    s_sumB += (int32_t)dB;
+
+    s_winIdx++;
+    if (s_winIdx >= ENCODER_RPM_WINDOW)
+    {
+        s_winIdx = 0U;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -101,33 +118,19 @@ int32_t Encoder_B_GetCount(void) { return s_countB; }
 int16_t Encoder_A_GetDelta(void) { return s_deltaA; }
 int16_t Encoder_B_GetDelta(void) { return s_deltaB; }
 
-static int32_t rpm_from_delta(int16_t delta, uint32_t interval_ms)
+/* rpm = window_counts * 60000 / (COUNTS_PER_REV * WINDOW * TICK_MS)
+ *
+ * Denominator is a compile-time constant: 1560 * 4 * 10 = 62400.
+ * Worst realistic numerator at 400 RPM is about 416 * 60000 = 2.5e7,
+ * comfortably inside int32. */
+#define ENC_RPM_DIVISOR  ((int32_t)ENCODER_COUNTS_PER_REV * \
+                          (int32_t)ENCODER_RPM_WINDOW *      \
+                          (int32_t)ENCODER_TICK_MS)
+
+static int32_t rpm_from_window(int32_t window_counts)
 {
-    int32_t divisor;
-
-    if (interval_ms == 0U)
-    {
-        return 0;
-    }
-
-    /* rpm = delta * 60000 / (COUNTS_PER_REV * interval_ms)
-     * Worst case numerator 32767 * 60000 = 1.97e9, inside int32 range. */
-    divisor = (int32_t)ENCODER_COUNTS_PER_REV * (int32_t)interval_ms;
-
-    if (divisor == 0)
-    {
-        return 0;
-    }
-
-    return ((int32_t)delta * 60000) / divisor;
+    return (window_counts * 60000) / ENC_RPM_DIVISOR;
 }
 
-int32_t Encoder_A_GetRPM(void)
-{
-    return rpm_from_delta(s_deltaA, s_lastIntervalMs);
-}
-
-int32_t Encoder_B_GetRPM(void)
-{
-    return rpm_from_delta(s_deltaB, s_lastIntervalMs);
-}
+int32_t Encoder_A_GetRPM(void) { return rpm_from_window(s_sumA); }
+int32_t Encoder_B_GetRPM(void) { return rpm_from_window(s_sumB); }
