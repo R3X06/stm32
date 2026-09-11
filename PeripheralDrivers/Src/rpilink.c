@@ -3,7 +3,11 @@
 #include "motors.h"
 #include "pid.h"
 #include "odom.h"
+#include "imu.h"
+#include "ir.h"
+#include "ultrasonic.h"
 #include <string.h>
+#include <stdio.h>
 
 static UART_HandleTypeDef *s_uart;
 
@@ -27,6 +31,10 @@ static volatile uint8_t s_quiet;
 /* How many times reception had to be re-armed. See the watchdog in
  * RpiLink_Poll(). Should stay at zero; anything else is line trouble. */
 static volatile uint32_t s_rearms;
+
+/* 0 none, 1 watchdog timeout, 2 wrong-way abort. Latched when a primitive
+ * ends badly and held until the whole line has been answered. */
+static uint8_t s_lineFailed;
 
 /* ===================================================================
  * Weak sensor stubs.
@@ -99,6 +107,7 @@ void RpiLink_Init(UART_HandleTypeDef *huart)
     s_lastOp     = CMD_NONE;
     s_quiet      = 0U;
     s_rearms     = 0U;
+    s_lineFailed = 0U;
 
     Cmd_Init();
 
@@ -154,6 +163,113 @@ void RpiLink_RxCallback(void)
 /* Executor                                                            */
 /* ------------------------------------------------------------------ */
 
+/* ===================================================================
+ * Immediate opcodes.
+ *
+ * Answered the instant the line is parsed, without touching the queue or the
+ * in-flight line, so a query is safe to send WHILE a move is running - which
+ * is the point. The RPi needs to watch the ultrasonic as it drives, not only
+ * between moves.
+ *
+ * Everything on the wire is an integer. Anything needing a decimal is scaled
+ * x10, because newlib-nano will not print floats unless the float printf is
+ * linked and it fails silently rather than loudly.
+ * =================================================================== */
+
+/* int32, not int16. IMU_GetHeading() free-runs and is only zeroed when a move
+ * launches, so a robot left spinning between moves can pass 3276.7 degrees and
+ * wrap a 16-bit result into a plausible-looking negative. */
+static int32_t scaled10(float v)
+{
+    return (int32_t)((v * 10.0f) + ((v < 0.0f) ? -0.5f : 0.5f));
+}
+
+static void answer_immediate(const Command_t *c)
+{
+    char b[96];
+
+    switch (c->op)
+    {
+    case CMD_Q_US:
+        snprintf(b, sizeof(b), "US,%u\n", (unsigned)Ultrasonic_GetCm());
+        break;
+
+    case CMD_Q_IR:
+        snprintf(b, sizeof(b), "IR,%u,%u\n",
+                 (unsigned)IR_LeftCm(), (unsigned)IR_RightCm());
+        break;
+
+    case CMD_Q_IRR:
+        snprintf(b, sizeof(b), "IRR,%u,%u\n",
+                 (unsigned)IR_LeftFiltered(), (unsigned)IR_RightFiltered());
+        break;
+
+    case CMD_Q_POSE:
+        {
+            Odom_Pose_t p;
+            Odom_GetPose(&p);
+            snprintf(b, sizeof(b), "POSE,%d,%d,%d\n",
+                     (int)p.x_mm, (int)p.y_mm, (int)scaled10(p.heading_deg));
+        }
+        break;
+
+    case CMD_Q_DIST:
+        snprintf(b, sizeof(b), "DIST,%ld\n", (long)Motion_GetTravelled());
+        break;
+
+    case CMD_Q_TURN:
+        snprintf(b, sizeof(b), "TURN,%d\n",
+                 (int)scaled10(Odom_GetHeadingTotal()));
+        break;
+
+    case CMD_Q_STAT:
+        snprintf(b, sizeof(b), "STAT,%d,%u,%u,%u\n",
+                 (int)Motion_GetState(),
+                 (unsigned)Motion_IsBusy(),
+                 (unsigned)IMU_IsReady(),
+                 (unsigned)Motion_GetArcProfile());
+        break;
+
+    case CMD_Q_IMU:
+        snprintf(b, sizeof(b), "IMU,%u,%d,%d,%lu,%d\n",
+                 (unsigned)IMU_IsReady(),
+                 (int)scaled10(IMU_GetHeading()),
+                 (int)scaled10(IMU_GetRateDps()),
+                 (unsigned long)IMU_GetStallCount(),
+                 (int)IMU_GetPeakRaw());
+        break;
+
+    case CMD_Q_XCHK:
+        snprintf(b, sizeof(b), "XCHK,%d,%d,%d,%u\n",
+                 (int)scaled10(Motion_GetXCheckDeg()),
+                 (int)scaled10((float)Motion_GetTurnedDeg()),
+                 (int)Motion_GetXCheckErrPct(),
+                 (unsigned)(Motion_XCheckFailed() ? 0U : 1U));
+        break;
+
+    case CMD_Q_VER:
+        snprintf(b, sizeof(b), "VER,%s,%d\n",
+                 CMD_FIRMWARE_NAME, (int)CMD_PROTOCOL_VERSION);
+        break;
+
+    case CMD_SET_PROFILE:
+        Motion_SetArcProfile((uint8_t)c->arg);
+        snprintf(b, sizeof(b), "%s", CMD_REPLY_OK);
+        break;
+
+    case CMD_SET_ZERO:
+        Odom_Reset();
+        snprintf(b, sizeof(b), "%s", CMD_REPLY_OK);
+        break;
+
+    default:
+        snprintf(b, sizeof(b), "%s", CMD_REPLY_RESEND);
+        break;
+    }
+
+    link_reply(b);
+}
+
 static void abort_everything(void)
 {
     Cmd_QueueFlush();
@@ -162,6 +278,7 @@ static void abort_everything(void)
     Motors_Coast();
     s_lineActive = 0U;
     s_f0Active   = 0U;
+    s_lineFailed = 0U;
 }
 
 /* Start one primitive. Returns 1 if it set the motion layer running. */
@@ -221,6 +338,7 @@ static uint8_t dispatch(Command_t c)
 void RpiLink_Poll(void)
 {
     char      line[CMD_LINE_MAX];
+    char     *p = line;
     Command_t next;
     uint16_t  i;
 
@@ -270,14 +388,45 @@ void RpiLink_Poll(void)
             }
         }
 
-        if (strcmp(line, "rst") == 0)
+        /* Trim surrounding whitespace before the single-token tests below.
+         * Cmd_ParseLine() treats spaces as delimiters and skips empty runs, so
+         * movement lines never cared - but RST and the immediate opcodes are
+         * matched against the WHOLE line, and "?US " with a trailing space
+         * would otherwise fall through to RESEND. Confusing, and trivial to
+         * prevent. */
+        {
+            uint16_t end;
+
+            while ((*p == ' ') || (*p == '\t')) { p++; }
+
+            end = (uint16_t)strlen(p);
+            while ((end > 0U) && ((p[end - 1U] == ' ') || (p[end - 1U] == '\t')))
+            {
+                p[end - 1U] = '\0';
+                end--;
+            }
+        }
+
+        if (strcmp(p, "rst") == 0)
         {
             /* Emergency abort. Drops everything queued, brakes now, and
              * replies NOTHING. The silence is part of the frozen protocol -
              * do not "helpfully" add an OK here. */
             abort_everything();
         }
-        else if (Cmd_ParseLine(line))
+        else if (Cmd_IsImmediate(Cmd_ParseToken(p).op))
+        {
+            /* A lone query or setter. Answered here and now, without touching
+             * the queue or s_lineActive, so it is safe to ask while a move is
+             * still running - which is the point of having queries at all.
+             * Cmd_ParseLine() rejects these inside a multi-token line, so this
+             * is the only path that can accept one. */
+            Command_t imm = Cmd_ParseToken(p);
+
+            s_quiet = 1U;
+            answer_immediate(&imm);
+        }
+        else if (Cmd_ParseLine(p))
         {
             /* A line parsed off the wire means a real host is driving, so the
              * console goes quiet from here. Anything else sharing this port
@@ -308,19 +457,36 @@ void RpiLink_Poll(void)
 
     if (Motion_IsBusy()) { return; }
 
-    /* A primitive that finished or timed out: clear it either way. The line
-     * replies OK even on a timeout - a stalled wheel must not leave the RPi
-     * blocked forever waiting on a reply that never comes. */
+    /* Latch how the primitive ended BEFORE clearing it - Motion_ClearState()
+     * drops TIMEOUT back to IDLE, so reading it afterwards always says the
+     * move succeeded. The failure has to survive to the end of the line,
+     * because the reply is owed to the line and not to the primitive. */
+    if (Motion_GetState() == MOTION_TIMEOUT)
+    {
+        s_lineFailed = Motion_WrongWayAborted() ? 2U : 1U;
+    }
+
     Motion_ClearState();
 
     next = Cmd_QueuePop();
 
     if (next.op == CMD_NONE)
     {
-        /* Whole line executed. One reply, now. */
+        /* Whole line executed. One reply, now.
+         *
+         * A failed primitive still replies - the sender must never be left
+         * blocked - but it no longer replies OK. That used to make a stalled
+         * wheel indistinguishable from a completed move, so the RPi carried
+         * on believing the robot had gone somewhere it had not. */
+        uint8_t failed = s_lineFailed;
+
         s_lineActive = 0U;
         s_f0Active   = 0U;
-        link_reply(CMD_REPLY_OK);
+        s_lineFailed = 0U;
+
+        if      (failed == 2U) { link_reply(CMD_REPLY_FAIL_WRONGWAY); }
+        else if (failed == 1U) { link_reply(CMD_REPLY_FAIL_TIMEOUT);  }
+        else                   { link_reply(CMD_REPLY_OK);            }
         return;
     }
 

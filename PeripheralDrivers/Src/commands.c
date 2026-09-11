@@ -88,6 +88,11 @@ static uint8_t parse_uint(const char *s, int16_t *out)
 /* Token parsing                                                       */
 /* ------------------------------------------------------------------ */
 
+uint8_t Cmd_IsImmediate(CmdOpcode_t op)
+{
+    return ((op >= CMD_Q_US) && (op <= CMD_SET_ZERO)) ? 1U : 0U;
+}
+
 Command_t Cmd_ParseToken(const char *token)
 {
     Command_t   cmd;
@@ -99,6 +104,40 @@ Command_t Cmd_ParseToken(const char *token)
     cmd.arg = 0;
 
     if ((token == 0) || (token[0] == '\0')) { return cmd; }
+
+    /* Immediate opcodes live in their own '?' and '!' namespaces, deliberately
+     * disjoint from the movement tokens. That is what stops a repeat of the
+     * 'S' problem, where one letter meant stop here and reverse on the sender.
+     * Neither character is touched by lower(), so the comparisons below work
+     * on raw input. */
+    if (token[0] == '?')
+    {
+        if (token_is(token, "?us"))   { cmd.op = CMD_Q_US;   }
+        else if (token_is(token, "?ir"))   { cmd.op = CMD_Q_IR;   }
+        else if (token_is(token, "?irr"))  { cmd.op = CMD_Q_IRR;  }
+        else if (token_is(token, "?pose")) { cmd.op = CMD_Q_POSE; }
+        else if (token_is(token, "?dist")) { cmd.op = CMD_Q_DIST; }
+        else if (token_is(token, "?turn")) { cmd.op = CMD_Q_TURN; }
+        else if (token_is(token, "?stat")) { cmd.op = CMD_Q_STAT; }
+        else if (token_is(token, "?imu"))  { cmd.op = CMD_Q_IMU;  }
+        else if (token_is(token, "?xchk")) { cmd.op = CMD_Q_XCHK; }
+        else if (token_is(token, "?ver"))  { cmd.op = CMD_Q_VER;  }
+        return cmd;
+    }
+
+    if (token[0] == '!')
+    {
+        if (token_is(token, "!zero")) { cmd.op = CMD_SET_ZERO; return cmd; }
+
+        if ((n = token_starts(token, "!prof")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            if (arg > 2)                      { return cmd; }
+            cmd.op  = CMD_SET_PROFILE;
+            cmd.arg = arg;
+        }
+        return cmd;
+    }
 
     /* Exact matches first. "RST" has to be tested before the R{n} prefix or
      * it parses as a reverse of "st" and fails for the wrong reason. */
@@ -164,6 +203,14 @@ uint8_t Cmd_ParseLine(const char *line)
 
                 staged[nstaged] = Cmd_ParseToken(tok);
                 if (staged[nstaged].op == CMD_INVALID) { return 0U; }
+
+                /* An immediate opcode is answered with a data line of its own,
+                 * so allowing one inside a movement line would mean two replies
+                 * for one line - and the sender's whole sequencing rests on
+                 * there being exactly one. Reject rather than silently pick a
+                 * winner. The caller handles a lone immediate token before it
+                 * ever reaches here. */
+                if (Cmd_IsImmediate(staged[nstaged].op)) { return 0U; }
 
                 nstaged++;
                 tlen = 0U;

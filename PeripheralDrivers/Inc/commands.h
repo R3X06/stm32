@@ -106,8 +106,49 @@ typedef enum
     CMD_ARC_REV_LEFT,   /* RL{n}  arg = degrees                    */
     CMD_STOP,           /* S      arg unused                       */
     CMD_RESET,          /* RST    arg unused                       */
-    CMD_INVALID         /* unrecognised token -> whole line RESEND */
+    CMD_INVALID,        /* unrecognised token -> whole line RESEND */
+
+    /* --- IMMEDIATE opcodes, appended after CMD_INVALID on purpose ---------
+     *
+     * The block above is frozen and must never be renumbered - the Task 2
+     * tokens still have to slot into it later without shifting anything. New
+     * opcodes therefore go here, past the sentinel. Nothing compares against
+     * the numeric values and the wire format is strings, so the ordering is
+     * internal detail.
+     *
+     * These are NOT queued. They are answered the moment the line is parsed,
+     * even mid-move, and they never touch the command queue or the in-flight
+     * line. See Cmd_IsImmediate(). */
+    CMD_Q_US,           /* ?US    front distance                   */
+    CMD_Q_IR,           /* ?IR    both IR, centimetres             */
+    CMD_Q_IRR,          /* ?IRR   both IR, raw filtered counts     */
+    CMD_Q_POSE,         /* ?POSE  x, y, heading                    */
+    CMD_Q_DIST,         /* ?DIST  distance this/last move          */
+    CMD_Q_TURN,         /* ?TURN  degrees this/last arc            */
+    CMD_Q_STAT,         /* ?STAT  motion state, busy, imu, profile */
+    CMD_Q_IMU,          /* ?IMU   gyro health                      */
+    CMD_Q_XCHK,         /* ?XCHK  last arc cross-check             */
+    CMD_Q_VER,          /* ?VER   identity and protocol version    */
+    CMD_SET_PROFILE,    /* !PROFn arg = 0..2                       */
+    CMD_SET_ZERO        /* !ZERO  zero odometry and heading        */
 } CmdOpcode_t;
+
+/* Bumped whenever the wire format changes in a way a sender must care about.
+ * Reported by ?VER so the RPi can assert compatibility at startup instead of
+ * discovering a mismatch halfway through a run. */
+#define CMD_PROTOCOL_VERSION    1
+#define CMD_FIRMWARE_NAME       "MDPG15-STM32"
+
+/* Replies for a primitive that did not complete. Previously a timed-out move
+ * replied OK, which made a stalled wheel indistinguishable from success - the
+ * sender carried on believing the robot had moved. */
+#define CMD_REPLY_FAIL_TIMEOUT   "FAIL,TIMEOUT\n"
+#define CMD_REPLY_FAIL_WRONGWAY  "FAIL,WRONGWAY\n"
+
+/* 1 for opcodes answered immediately rather than queued. Such a token is only
+ * valid ALONE on a line - mixed into a movement line it is a parse failure,
+ * because one line may only ever produce one reply. */
+uint8_t Cmd_IsImmediate(CmdOpcode_t op);
 
 typedef struct
 {

@@ -112,6 +112,13 @@ const ArcProfile_t *Motion_GetArcProfileInfo(uint8_t idx)
     return (idx < MOTION_ARC_PROFILE_COUNT) ? &s_profiles[idx] : &s_profiles[0];
 }
 
+/* Set when an arc was aborted for rotating AWAY from its target, cleared when
+ * the next primitive launches. Both that and the watchdog land in
+ * MOTION_TIMEOUT, but they mean completely different things - a stalled wheel
+ * versus a sign inversion or a lying gyro - and the command layer reports them
+ * separately so the fix is obvious from the reply alone. */
+static uint8_t  s_wrongWay;
+
 static int16_t  s_arcCommandDeg;  /* what the caller ASKED for, uncompensated */
 static uint8_t  s_recentreStep;   /* 0 waiting to stop, 1 preloaded, 2 done */
 static uint16_t s_recentreTick;
@@ -215,6 +222,8 @@ static void motion_begin_align(uint16_t servo_us)
 /* Settle finished: zero the odometry now, then start driving. */
 static void motion_launch(void)
 {
+    s_wrongWay = 0U;
+
     Odom_Reset();
 
     s_arcStartDist = Odom_GetDistance();   /* zero, just after the reset */
@@ -476,7 +485,8 @@ void Motion_Tick(void)
                 if (togo > (target_mag + MOTION_ARC_WRONGWAY_DEG))
                 {
                     motion_halt();
-                    s_state = MOTION_TIMEOUT;
+                    s_wrongWay = 1U;
+                    s_state    = MOTION_TIMEOUT;
                     return;
                 }
             }
@@ -656,6 +666,8 @@ void Motion_Tick(void)
         }
     }
 }
+
+uint8_t Motion_WrongWayAborted(void) { return s_wrongWay; }
 
 uint8_t Motion_IsBusy(void)
 {

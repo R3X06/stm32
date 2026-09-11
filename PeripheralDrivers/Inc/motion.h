@@ -381,6 +381,12 @@ void Motion_Stop(void);
 /* 1 while a primitive is running. Poll this to know when to reply OK. */
 uint8_t Motion_IsBusy(void);
 
+/* 1 if the last arc was aborted for turning AWAY from its target rather than
+ * for the watchdog. Both land in MOTION_TIMEOUT but they mean different
+ * things: the watchdog is a stalled wheel, this is a sign inversion or a gyro
+ * that is lying. Cleared when the next primitive launches. */
+uint8_t Motion_WrongWayAborted(void);
+
 MotionState_t Motion_GetState(void);
 
 /* Clears DONE/TIMEOUT back to IDLE once the caller has read the result. */
