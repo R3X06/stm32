@@ -35,6 +35,12 @@
   *               ir.h. SHORT streams a sample to USART3.
   *    9 IMU      Gyro diagnostics: heading, rate, poll rate, stalls, and the
   *               peak raw value against the full-scale rail.
+  *   10 NAV      Navigate to the next face. SHORT runs the whole sequence,
+  *               SHORT again aborts it:
+  *                 approach to 10 cm on the ultrasonic -> SNAP,<n> to the Pi
+  *                 -> wait for !SNAPOK<n> -> R30 -> FR90 -> FL180
+  *                 -> approach to 10 cm again.
+  *               Needs nav_face_capture.py running on the Pi.
   *
   *  CONTROL TICK - TIM6, 100 Hz, priority 6. Order is not negotiable:
   *      Encoders_Update() -> IR_Update() -> Ultrasonic_Tick() -> IMU_Tick()
@@ -89,7 +95,33 @@
 
 typedef enum { MODE_DRIVE = 0, MODE_SETDIST, MODE_TURN, MODE_SETANGLE,
                MODE_PROFILE, MODE_SERVO, MODE_SENSE, MODE_IRCAL, MODE_IMU,
-               MODE_COUNT } uimode_t;
+               MODE_NAV, MODE_COUNT } uimode_t;
+
+/* NAV mode - navigate to the next face.
+ *
+ * The approach does NOT trip on a rolling reading. At cruise the ultrasonic
+ * median is ~120 ms stale, which is several cm of travel and a different few
+ * cm every run. Instead the robot stands still, lets the median refill with
+ * readings taken at rest, then drives the measured gap on odometry and
+ * measures again. Forward or reverse falls out of the sign of the error. */
+#define NAV_STANDOFF_CM      10
+#define NAV_TOL_CM           1        /* close enough, either side       */
+#define NAV_MAX_PASSES       4        /* measure-and-drive attempts      */
+#define NAV_SETTLE_MS        400U     /* > 3 pings, so the median3 is all at-rest */
+#define NAV_MAX_RANGE_CM     150      /* further than this is not the face */
+
+#define NAV_BACKOFF_MM       300
+#define NAV_TURN1_DEG        90       /* forward right */
+#define NAV_TURN2_DEG        180      /* forward left  */
+
+/* The Pi may start its script late, or drop a line. Re-ask every
+   NAV_SNAP_RETRY_MS; give up after NAV_SNAP_TIMEOUT_MS. The Pi takes one
+   photo per id, so a repeat only re-sends the ack. */
+#define NAV_SNAP_RETRY_MS    2000U
+#define NAV_SNAP_TIMEOUT_MS  20000U
+
+typedef enum { NAV_IDLE = 0, NAV_APPROACH1, NAV_SNAP, NAV_BACKOFF, NAV_TURN1,
+               NAV_TURN2, NAV_APPROACH2, NAV_DONE, NAV_FAIL } navstep_t;
 
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef  htim2;    /* encoder A  PA15 / PB3      */
@@ -168,6 +200,17 @@ static volatile int32_t  g_runStartB = 0;
 static volatile uint8_t  g_repTimeout = 0;
 static volatile uint8_t  g_repValid = 0;
 
+/* NAV sequence. Main loop only, so none of it needs to be volatile. */
+static navstep_t   g_navStep     = NAV_IDLE;
+static uint8_t     g_navMoving   = 0;    /* a primitive is out, awaiting DONE */
+static uint8_t     g_navPass     = 0;    /* approach passes used this leg     */
+static uint32_t    g_navAtMs     = 0;    /* last move ended / leg started     */
+static uint16_t    g_navSnapId   = 0;    /* id of the photo being asked for   */
+static uint32_t    g_navSnapT0   = 0;    /* first SNAP sent                   */
+static uint32_t    g_navSnapTx   = 0;    /* last SNAP sent                    */
+static uint16_t    g_navLastCm   = SENSOR_NO_READING;
+static const char *g_navWhy      = "";
+
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -185,6 +228,11 @@ static void MX_I2C2_Init(void);
 
 static void Btn_Poll(void);
 static void Display(void);
+
+static void Nav_Start(uint32_t now);
+static void Nav_Abort(const char *why);
+static void Nav_OnMoveDone(uint8_t timedOut, uint32_t now);
+static void Nav_Poll(uint32_t now);
 
 /* ==========================================================================
  *  Button. Polled from the control tick so the timing is exact.
@@ -533,6 +581,49 @@ static void Display(void)
         }
         break;
 
+    case MODE_NAV:
+        {
+            static const char *ns[] = { "IDLE", "APPR1", "SNAP", "R30",
+                                        "FR90", "FL180", "APPR2", "DONE",
+                                        "FAIL" };
+
+            snprintf(line, sizeof(line), "10 NAV %s", ns[(int)g_navStep]);
+            ShowLine(0, line);
+            FmtCm(line, sizeof(line), "US ", Ultrasonic_GetCm());
+            ShowLine(12, line);
+
+            if (g_navStep == NAV_SNAP)
+            {
+                snprintf(line, sizeof(line), "photo %u  %lus",
+                         (unsigned)g_navSnapId,
+                         (unsigned long)((HAL_GetTick() - g_navSnapT0) / 1000U));
+            }
+            else if ((g_navStep == NAV_APPROACH1) || (g_navStep == NAV_APPROACH2))
+            {
+                snprintf(line, sizeof(line), "pass %u/%u tgt %d",
+                         (unsigned)g_navPass, (unsigned)NAV_MAX_PASSES,
+                         (int)NAV_STANDOFF_CM);
+            }
+            else if (g_navLastCm != SENSOR_NO_READING)
+            {
+                snprintf(line, sizeof(line), "last %u cm",
+                         (unsigned)g_navLastCm);
+            }
+            else
+            {
+                line[0] = '\0';
+            }
+            ShowLine(24, line);
+
+            /* Why it stopped, held until the next run - a failure that blanks
+               itself is a failure nobody reads. */
+            ShowLine(36, (g_navStep == NAV_FAIL) ? g_navWhy : "");
+            ShowLine(48, ((g_navStep == NAV_IDLE) || (g_navStep == NAV_DONE) ||
+                          (g_navStep == NAV_FAIL))
+                         ? "short = GO" : "short = ABORT");
+        }
+        break;
+
     case MODE_SETDIST:
         ShowLine(0,  "2 SET DISTANCE");
         snprintf(line, sizeof(line), "tgt %4ld mm", (long)g_targetMm);
@@ -766,6 +857,187 @@ static void PrintSensors(void)
 }
 
 /* ==========================================================================
+ *  NAV - navigate to the next face
+ *
+ *  Main loop only. Every step launches at most one primitive and then waits
+ *  for Nav_OnMoveDone(), which the main loop calls off g_reportReady. Nothing
+ *  here blocks, so the button, the display and the Pi link all stay live.
+ * ========================================================================== */
+
+static void Nav_Enter(navstep_t step, uint32_t now)
+{
+    g_navStep = step;
+    g_navPass = 0U;
+    g_navAtMs = now;
+}
+
+static void Nav_Straight(int32_t mm)
+{
+    g_navMoving = 1U;
+    Motion_DriveDistance(mm);
+}
+
+static void Nav_Arc(int16_t deg, uint8_t right)
+{
+    g_navMoving = 1U;
+    Motion_DriveArc(deg, 1U, right);
+}
+
+static void Nav_SendSnap(uint32_t now)
+{
+    char msg[24];
+
+    snprintf(msg, sizeof(msg), "SNAP,%u\n", (unsigned)g_navSnapId);
+    RpiLink_Send(msg);
+    g_navSnapTx = now;
+}
+
+static void Nav_Start(uint32_t now)
+{
+    g_navMoving = 0U;
+    g_navLastCm = SENSOR_NO_READING;
+    g_navWhy    = "";
+
+    /* Settle before the first measurement too: the robot may have just been
+       put down, and the median still holds readings from being carried. */
+    Nav_Enter(NAV_APPROACH1, now);
+    RpiLink_Log("\r\nNAV starting\r\n");
+}
+
+static void Nav_Abort(const char *why)
+{
+    Motion_Stop();
+    Motion_ClearState();
+    Motors_Coast();
+
+    g_navMoving = 0U;
+    g_navStep   = NAV_FAIL;
+    g_navWhy    = why;
+
+    RpiLink_Log("NAV FAIL: ");
+    RpiLink_Log(why);
+    RpiLink_Log("\r\n");
+}
+
+static void Nav_OnMoveDone(uint8_t timedOut, uint32_t now)
+{
+    if (!g_navMoving) { return; }
+
+    g_navMoving = 0U;
+    g_navAtMs   = now;
+
+    /* TIMEOUT covers both the watchdog and a wrong-way arc. Either way the
+       robot is not where the rest of the sequence assumes it is. */
+    if (timedOut) { Nav_Abort("MOVE TIMEOUT"); }
+}
+
+/* One measure-and-drive pass. Returns 1 once within tolerance, 0 while still
+   working. Aborts the sequence itself on anything it cannot recover from. */
+static uint8_t Nav_Approach(uint32_t now)
+{
+    uint16_t cm;
+    int32_t  err;
+
+    if (g_navMoving) { return 0U; }
+    if ((now - g_navAtMs) < NAV_SETTLE_MS) { return 0U; }
+
+    cm          = Ultrasonic_GetCm();
+    g_navLastCm = cm;
+
+    /* Refuse to drive at something it cannot see. Creeping forward hopefully
+       is how a robot ends up in the face it was meant to photograph. */
+    if (cm == SENSOR_NO_READING)    { Nav_Abort("NO ECHO");  return 0U; }
+    if (cm > NAV_MAX_RANGE_CM)      { Nav_Abort("TOO FAR");  return 0U; }
+
+    err = (int32_t)cm - NAV_STANDOFF_CM;
+    if ((err <= NAV_TOL_CM) && (err >= -NAV_TOL_CM)) { return 1U; }
+
+    if (g_navPass >= NAV_MAX_PASSES) { Nav_Abort("NO CONVERGE"); return 0U; }
+    g_navPass++;
+
+    /* Positive error: too far, drive forward. Negative: too close, reverse. */
+    Nav_Straight(err * 10);
+    return 0U;
+}
+
+static void Nav_Poll(uint32_t now)
+{
+    char msg[40];
+
+    switch (g_navStep)
+    {
+    case NAV_APPROACH1:
+        if (Nav_Approach(now))
+        {
+            snprintf(msg, sizeof(msg), "NAV at face, US %u cm\r\n",
+                     (unsigned)g_navLastCm);
+            RpiLink_Log(msg);
+
+            /* 1..32767 - the Pi echoes it back through a signed 16-bit parse,
+               and 0 is reserved for "no ack yet". */
+            g_navSnapId = (uint16_t)((g_navSnapId % 32767U) + 1U);
+            g_navSnapT0 = now;
+            Nav_SendSnap(now);
+            Nav_Enter(NAV_SNAP, now);
+        }
+        break;
+
+    case NAV_SNAP:
+        if (RpiLink_GetSnapAckId() == g_navSnapId)
+        {
+            RpiLink_Log("NAV photo acked\r\n");
+            Nav_Enter(NAV_BACKOFF, now);
+            Nav_Straight(-NAV_BACKOFF_MM);
+        }
+        else if ((now - g_navSnapT0) >= NAV_SNAP_TIMEOUT_MS)
+        {
+            Nav_Abort("NO PI ACK");
+        }
+        else if ((now - g_navSnapTx) >= NAV_SNAP_RETRY_MS)
+        {
+            Nav_SendSnap(now);
+        }
+        break;
+
+    case NAV_BACKOFF:
+        if (!g_navMoving)
+        {
+            Nav_Enter(NAV_TURN1, now);
+            Nav_Arc(NAV_TURN1_DEG, 1U);
+        }
+        break;
+
+    case NAV_TURN1:
+        if (!g_navMoving)
+        {
+            Nav_Enter(NAV_TURN2, now);
+            Nav_Arc(NAV_TURN2_DEG, 0U);
+        }
+        break;
+
+    case NAV_TURN2:
+        if (!g_navMoving)
+        {
+            Nav_Enter(NAV_APPROACH2, now);
+        }
+        break;
+
+    case NAV_APPROACH2:
+        if (Nav_Approach(now))
+        {
+            snprintf(msg, sizeof(msg), "NAV DONE, US %u cm\r\n",
+                     (unsigned)g_navLastCm);
+            RpiLink_Log(msg);
+            g_navStep = NAV_DONE;
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* ==========================================================================
  *  main
  * ========================================================================== */
 
@@ -831,7 +1103,8 @@ int main(void)
     RpiLink_Log("\r\n=== C30D FUNCTIONAL TEST BUILD ===\r\n");
     RpiLink_Log("LONG press = mode, SHORT = action\r\n");
     RpiLink_Log("1 DRIVE 2 SETDIST 3 TURN 4 SETANGLE\r\n");
-    RpiLink_Log("5 PROFILE 6 SERVO 7 SENSE 8 IRCAL 9 IMU\r\n\r\n");
+    RpiLink_Log("5 PROFILE 6 SERVO 7 SENSE 8 IRCAL 9 IMU\r\n");
+    RpiLink_Log("10 NAV (needs nav_face_capture.py on the Pi)\r\n\r\n");
 
     /* Tick LAST - nothing fires against an uninitialised module. */
     MX_TIM6_Init();
@@ -853,6 +1126,13 @@ int main(void)
             {
                 g_turnValid = 1U;
                 PrintTurnReport();
+            }
+            if (g_mode == MODE_NAV)
+            {
+                /* A NAV leg is not an A.3 run. Left valid, the DRIVE screen
+                   would later show it against a target it never had. */
+                g_repValid = 0U;
+                Nav_OnMoveDone(g_repTimeout, now);
             }
         }
 
@@ -876,13 +1156,33 @@ int main(void)
                 Servo_SetRawUs(SERVO_CENTER_US);
             }
 
+            /* The move was just stopped under it, so no DONE will ever come
+               back. Drop the sequence rather than leave it waiting. */
+            g_navStep   = NAV_IDLE;
+            g_navMoving = 0U;
+
             g_mode = (uimode_t)(((int)g_mode + 1) % (int)MODE_COUNT);
         }
         else if (g_evtShort)
         {
             g_evtShort = 0U;
 
-            if (Motion_IsBusy())
+            /* Ahead of the generic busy-stop below: NAV spends much of its
+               life NOT moving - settling, or waiting on the Pi - and a press
+               then has to abort the sequence, not start another one. */
+            if (g_mode == MODE_NAV)
+            {
+                if ((g_navStep == NAV_IDLE) || (g_navStep == NAV_DONE) ||
+                    (g_navStep == NAV_FAIL))
+                {
+                    Nav_Start(now);
+                }
+                else
+                {
+                    Nav_Abort("ABORTED");
+                }
+            }
+            else if (Motion_IsBusy())
             {
                 Motion_Stop();
                 Motion_ClearState();
@@ -969,6 +1269,8 @@ int main(void)
                 PrintSensors();
             }
         }
+
+        if (g_mode == MODE_NAV) { Nav_Poll(now); }
 
         /* Sweep watchdog: never leave the servo stalled against a stop. */
         if (g_sweepHeld && ((now - g_sweepAtMs) >= SERVO_SWEEP_HOLD_MS))

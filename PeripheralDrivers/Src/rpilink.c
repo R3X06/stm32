@@ -36,6 +36,9 @@ static volatile uint32_t s_rearms;
  * ends badly and held until the whole line has been answered. */
 static uint8_t s_lineFailed;
 
+/* Id carried by the last !SNAPOK<n>. 0 means none yet - SNAP ids start at 1. */
+static volatile uint16_t s_snapAckId;
+
 /* ===================================================================
  * Weak sensor stubs.
  *
@@ -92,6 +95,16 @@ void RpiLink_Log(const char *s)
 uint8_t  RpiLink_IsQuiet(void)      { return s_quiet; }
 uint32_t RpiLink_GetRearmCount(void) { return s_rearms; }
 
+/* Ungated, like a protocol reply. The SNAP request is a protocol message the
+ * Pi is waiting on, so it must still go out after the console has latched
+ * quiet - which it will have, the moment the Pi's first ack arrives. */
+void RpiLink_Send(const char *s)
+{
+    link_reply(s);
+}
+
+uint16_t RpiLink_GetSnapAckId(void) { return s_snapAckId; }
+
 /* ------------------------------------------------------------------ */
 /* Receive                                                             */
 /* ------------------------------------------------------------------ */
@@ -108,6 +121,7 @@ void RpiLink_Init(UART_HandleTypeDef *huart)
     s_quiet      = 0U;
     s_rearms     = 0U;
     s_lineFailed = 0U;
+    s_snapAckId  = 0U;
 
     Cmd_Init();
 
@@ -259,6 +273,11 @@ static void answer_immediate(const Command_t *c)
 
     case CMD_SET_ZERO:
         Odom_Reset();
+        snprintf(b, sizeof(b), "%s", CMD_REPLY_OK);
+        break;
+
+    case CMD_SNAP_ACK:
+        s_snapAckId = (uint16_t)c->arg;
         snprintf(b, sizeof(b), "%s", CMD_REPLY_OK);
         break;
 

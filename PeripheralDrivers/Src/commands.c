@@ -90,7 +90,7 @@ static uint8_t parse_uint(const char *s, int16_t *out)
 
 uint8_t Cmd_IsImmediate(CmdOpcode_t op)
 {
-    return ((op >= CMD_Q_US) && (op <= CMD_SET_ZERO)) ? 1U : 0U;
+    return ((op >= CMD_Q_US) && (op <= CMD_SNAP_ACK)) ? 1U : 0U;
 }
 
 Command_t Cmd_ParseToken(const char *token)
@@ -128,6 +128,16 @@ Command_t Cmd_ParseToken(const char *token)
     if (token[0] == '!')
     {
         if (token_is(token, "!zero")) { cmd.op = CMD_SET_ZERO; return cmd; }
+
+        /* Pi's reply to SNAP,<n>: photo n is taken. The id is carried back so
+         * a late duplicate ack can never be mistaken for the next photo's. */
+        if ((n = token_starts(token, "!snapok")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            cmd.op  = CMD_SNAP_ACK;
+            cmd.arg = arg;
+            return cmd;
+        }
 
         if ((n = token_starts(token, "!prof")) != 0U)
         {

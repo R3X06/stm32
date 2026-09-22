@@ -72,6 +72,20 @@ void RpiLink_Log(const char *s);
 /* 1 once the console has latched off. */
 uint8_t RpiLink_IsQuiet(void);
 
+/* ---------------------------------------------------------------------------
+ * Photo handshake, used by the NAV mode in main.c. The STM is the one asking
+ * here, which is the reverse of every other exchange on this link:
+ *
+ *   STM -> RPi :  SNAP,<n>\n       please take photo n
+ *   RPi -> STM :  !SNAPOK<n>\n     photo n is taken  (STM replies OK)
+ *
+ * RpiLink_Send() is ungated - unlike RpiLink_Log() it still transmits after
+ * the console has latched quiet. Main loop only. */
+void     RpiLink_Send(const char *s);
+
+/* Id from the last !SNAPOK<n>, 0 if none has arrived since reset. */
+uint16_t RpiLink_GetSnapAckId(void);
+
 /* Times reception had to be re-armed after the HAL tore it down on a line
  * error. Should be 0. Anything else means the link is glitching and being
  * silently recovered - go and look at the wiring before it bites in a run. */

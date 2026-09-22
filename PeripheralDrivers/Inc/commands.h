@@ -130,7 +130,8 @@ typedef enum
     CMD_Q_XCHK,         /* ?XCHK  last arc cross-check             */
     CMD_Q_VER,          /* ?VER   identity and protocol version    */
     CMD_SET_PROFILE,    /* !PROFn arg = 0..2                       */
-    CMD_SET_ZERO        /* !ZERO  zero odometry and heading        */
+    CMD_SET_ZERO,       /* !ZERO  zero odometry and heading        */
+    CMD_SNAP_ACK        /* !SNAPOKn  photo n taken, arg = n        */
 } CmdOpcode_t;
 
 /* Bumped whenever the wire format changes in a way a sender must care about.

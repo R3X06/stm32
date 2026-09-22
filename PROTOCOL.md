@@ -192,6 +192,29 @@ Robot footprint is roughly **18.8 cm wide by 23 cm long**.
 
 ---
 
+## 7a. Photo handshake — NAV mode only
+
+The one exchange where the **STM asks and the Pi answers**. Used only by OLED
+mode 10 (NAV), started from the button; the Pi side is
+`nav_face_capture.py`.
+
+| Direction | Line | Meaning |
+|---|---|---|
+| STM → RPi | `SNAP,<n>` | Robot is at the face; take photo `n` |
+| RPi → STM | `!SNAPOK<n>` | Photo `n` is taken. STM replies `OK` |
+
+- `n` runs 1–32767 and wraps back to 1.
+- The STM re-sends `SNAP,<n>` every **2 s** until the matching ack arrives,
+  and aborts the sequence after **20 s**.
+- The Pi must take **one photo per `n`**. A repeated `SNAP,<n>` is a re-ask,
+  so answer it with the ack again and take no second photo.
+- The ack must carry the same `n`. An ack for any other id is ignored, so
+  a late duplicate can never count as the next face's photo.
+- `SNAP` is sent even after the console has gone quiet (§9 stage 2). It is
+  a protocol message, not log output.
+
+---
+
 ## 8. Reserved — not implemented
 
 The parser returns a parse failure for these, so a line containing one gets
